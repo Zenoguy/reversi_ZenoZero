@@ -500,4 +500,4 @@ which regime it is in.
 
 ---
 
-*ZenoZero 1.0.0 — topology-aware meta-controlled search*
+*ZenoZero 1.0.0 — A lightweight, tree-topology-based approximation to rational metareasoning in MCTS.*
