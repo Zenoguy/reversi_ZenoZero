@@ -62,11 +62,12 @@ from pathlib import Path
 
 import torch
 
+
 from reversi_phase5_topology_core import (
     ReversiGame, MCTSNode,
-    TacticalSolver, PatternHeuristic, CompactReversiNet
+    TacticalSolver, PatternHeuristic, CompactReversiNet,
+    _nb_ucb_select
 )
-
 
 # ── Calibration result dataclass ──────────────────────────────────────────────
 
@@ -291,15 +292,27 @@ class ThresholdCalibrator:
             value = -value
 
     def _select(self, node: MCTSNode) -> MCTSNode:
-        best, best_child = -float('inf'), None
-        sqrt_n = np.sqrt(node.visit_count + 1e-8)
-        for child in node.children.values():
-            q = child.value_sum / child.visit_count if child.visit_count else 0.0
-            u = 1.414 * child.prior * sqrt_n / (1 + child.visit_count)
-            s = q + u
-            if s > best:
-                best, best_child = s, child
-        return best_child
+        """Pure PUCT probe — no heuristic injection. Uses @njit kernel."""
+        children = list(node.children.values())
+        n        = len(children)
+
+        q_values     = np.empty(n, dtype=np.float64)
+        priors       = np.empty(n, dtype=np.float64)
+        visit_counts = np.empty(n, dtype=np.float64)
+        h_astars     = np.zeros(n, dtype=np.float64)
+
+        for i, child in enumerate(children):
+            q_values[i]     = child.value_sum / child.visit_count if child.visit_count else 0.0
+            priors[i]       = child.prior
+            visit_counts[i] = child.visit_count
+
+        idx = _nb_ucb_select(
+            q_values, priors, visit_counts,
+            float(node.visit_count),
+            1.414, h_astars,
+            0.0, False,
+        )
+        return children[idx]
 
     def _expand(self, node: MCTSNode, prior: np.ndarray) -> MCTSNode:
         move = node.untried_moves.pop(np.random.randint(len(node.untried_moves)))

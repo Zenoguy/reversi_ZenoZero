@@ -27,7 +27,7 @@ from dataclasses import dataclass
 
 from reversi_phase5_topology_core import (
     ReversiGame, MCTSNode, TacticalSolver,
-    CompactReversiNet
+    CompactReversiNet, _nb_ucb_select
 )
 # SelfPlayRecord reused from layers file
 from reversi_phase5_topology_layers import SelfPlayRecord
@@ -178,21 +178,30 @@ class PureMCTS:
             n.value_sum   += value
             value = -value
 
+
+# Replace PureMCTS._select:
     def _select(self, node: MCTSNode) -> MCTSNode:
-        """Standard PUCT — no heuristic injection."""
-        best_score = -float('inf')
-        best_child = None
-        sqrt_n     = np.sqrt(node.visit_count + 1e-8)
+        """Standard PUCT — no heuristic. Uses @njit kernel."""
+        children = list(node.children.values())
+        n        = len(children)
 
-        for child in node.children.values():
-            q     = child.value_sum / child.visit_count if child.visit_count else 0.0
-            u     = self.C_PUCT * child.prior * sqrt_n / (1 + child.visit_count)
-            score = q + u
-            if score > best_score:
-                best_score = score
-                best_child = child
+        q_values     = np.empty(n, dtype=np.float64)
+        priors       = np.empty(n, dtype=np.float64)
+        visit_counts = np.empty(n, dtype=np.float64)
+        h_astars     = np.zeros(n, dtype=np.float64)   # zeroed — kernel ignores when use_heuristic=False
 
-        return best_child
+        for i, child in enumerate(children):
+            q_values[i]     = child.value_sum / child.visit_count if child.visit_count else 0.0
+            priors[i]       = child.prior
+            visit_counts[i] = child.visit_count
+
+        idx = _nb_ucb_select(
+            q_values, priors, visit_counts,
+            float(node.visit_count),
+            self.C_PUCT, h_astars,
+            0.0, False,   # lambda_h=0, use_heuristic=False
+        )
+        return children[idx]
 
     def _expand(self, node: MCTSNode, prior: np.ndarray) -> MCTSNode:
         move = node.untried_moves.pop(

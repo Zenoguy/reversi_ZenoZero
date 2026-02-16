@@ -29,11 +29,13 @@ from dataclasses import dataclass, field
 
 import torch
 
+
+
 from reversi_phase5_topology_core import (
     ReversiGame, MCTSNode, TacticalSolver,
-    PatternHeuristic, CompactReversiNet
+    PatternHeuristic, CompactReversiNet,
+    _nb_ucb_select   # ← import the kernel
 )
-
 
 # ── Training data record ──────────────────────────────────────────────────────
 
@@ -79,27 +81,23 @@ class TreeMetrics:
             return {'visit_entropy': 0.0, 'dominance_gap': 0.0,
                     'value_variance': 0.0, 'num_children': 0}
 
-        children    = list(root.children.values())
-        visits      = np.array([c.visit_count for c in children], dtype=np.float64)
-        total       = visits.sum()
+        children = list(root.children.values())
+        visits   = np.array([c.visit_count for c in children], dtype=np.float64)
+        total    = visits.sum()
 
-        if total == 0:
-            probs = np.ones(len(visits)) / len(visits)
-        else:
-            probs = visits / total
+        probs = visits / total if total > 0 else np.ones(len(visits)) / len(visits)
+        raw_h = -np.sum(probs * np.log(probs + 1e-12))
+        max_h = np.log(len(children))
+        H_v   = float(raw_h / (max_h + 1e-12)) if max_h > 0 else 0.0
 
-        # H_v: normalised Shannon entropy
-        raw_h   = -np.sum(probs * np.log(probs + 1e-12))
-        max_h   = np.log(len(children))
-        H_v     = float(raw_h / (max_h + 1e-12)) if max_h > 0 else 0.0
+        sv = np.sort(visits)[::-1]
+        G  = float((sv[0] - sv[1]) / (total + 1e-12)) if len(sv) >= 2 else 1.0
 
-        # G: gap between top-2 visit counts
-        sorted_v = np.sort(visits)[::-1]
-        G = float((sorted_v[0] - sorted_v[1]) / (total + 1e-12)) if len(sorted_v) >= 2 else 1.0
-
-        # Var_Q: variance of mean Q values (only visited children)
-        qs = [c.value_sum / c.visit_count for c in children if c.visit_count > 0]
-        Var_Q = float(np.var(qs)) if len(qs) >= 2 else 0.0
+        # Vectorised Q extraction — no Python loop
+        vc   = visits.copy()
+        vs   = np.array([c.value_sum for c in children], dtype=np.float64)
+        mask = vc > 0
+        Var_Q = float(np.var(vs[mask] / vc[mask])) if mask.sum() >= 2 else 0.0
 
         return {
             'visit_entropy':  H_v,
@@ -107,7 +105,6 @@ class TreeMetrics:
             'value_variance': Var_Q,
             'num_children':   len(children),
         }
-
 
 # ── Layer 4: Lambda controller ────────────────────────────────────────────────
 
@@ -503,25 +500,32 @@ class TopologyAwareMCTS:
             n.value_sum   += value
             value = -value   # flip perspective each level
 
-    def _select(self, node: MCTSNode, lam: float, c_puct: float) -> MCTSNode:
+    def _select(self, node: MCTSNode, lambda_h: float, c_puct: float) -> MCTSNode:
         """
-        Layer 2: UCB + λ·h_astar
-        h_astar is read from the cached field — NO heuristic call here.
+        Layer 2: PUCT + λ·h_astar.
+        All scoring runs inside the @njit kernel — no Python loop over children.
         """
-        best_score  = -float('inf')
-        best_child  = None
-        sqrt_parent = np.sqrt(node.visit_count + 1e-8)
+        children = list(node.children.values())
+        n        = len(children)
 
-        for child in node.children.values():
-            q = child.value_sum / child.visit_count if child.visit_count else 0.0
-            u = c_puct * child.prior * sqrt_parent / (1 + child.visit_count)
-            h = lam * child.h_astar if (self.use_heuristic and lam > 0) else 0.0
-            score = q + u + h
-            if score > best_score:
-                best_score = score
-                best_child = child
+        q_values     = np.empty(n, dtype=np.float64)
+        priors       = np.empty(n, dtype=np.float64)
+        visit_counts = np.empty(n, dtype=np.float64)
+        h_astars     = np.empty(n, dtype=np.float64)
 
-        return best_child
+        for i, child in enumerate(children):
+            q_values[i]     = child.value_sum / child.visit_count if child.visit_count else 0.0
+            priors[i]       = child.prior
+            visit_counts[i] = child.visit_count
+            h_astars[i]     = child.h_astar
+
+        idx = _nb_ucb_select(
+            q_values, priors, visit_counts,
+            float(node.visit_count),
+            c_puct, h_astars, lambda_h,
+            self.use_heuristic,
+        )
+        return children[idx]
 
     def _expand(self, node: MCTSNode, prior: np.ndarray) -> MCTSNode:
         """
