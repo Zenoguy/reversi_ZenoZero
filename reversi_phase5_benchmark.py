@@ -355,7 +355,7 @@ def main():
 
     if cfg.checkpoint:
         print(f"  Loading checkpoint: {cfg.checkpoint}")
-        ckpt = torch.load(cfg.checkpoint, map_location='cpu')
+        ckpt = torch.load(cfg.checkpoint, map_location='cpu', weights_only=False)
         net.load_state_dict(ckpt['model_state_dict'])
         thresholds = ckpt.get('thresholds', thresholds)
         print(f"  Thresholds from checkpoint: {thresholds}")
