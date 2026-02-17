@@ -1,1 +1,5 @@
-/checkpoints
+# Large training artifacts
+checkpoints/
+*.pkl
+*.pt
+*.pth
