@@ -124,11 +124,15 @@ class LambdaController:
         self.history: List[float] = []
 
     def compute_lambda(self, H_v: float, G: float, Var_Q: float) -> float:
-        var_term = min(Var_Q, 1.0)   # clamp before subtracting
+        var_term = min(Var_Q, 1.0)
+        # Rebalanced: upweight Var_Q (true uncertainty signal),
+        # downweight G (naturally high in Reversi once any structure forms).
+        # Old weights 0.4/0.4/0.2 produced λ≈0.85 in almost all midgame positions.
+        # New weights keep λ genuinely dynamic.
         lam = (
-            0.4 * (1.0 - H_v) +
-            0.4 * G +
-            0.2 * (1.0 - var_term)
+            0.3 * (1.0 - H_v) +
+            0.3 * G +
+            0.4 * (1.0 - var_term)
         )
         lam = float(np.clip(lam, 0.0, 1.0))
         self.history.append(lam)
@@ -153,8 +157,13 @@ class DynamicExploration:
     def __init__(self, base_c: float = 1.414):
         self.base_c = base_c
 
-    def compute_c_puct(self, H_v: float) -> float:
-        return self.base_c * (1.0 + H_v)
+    def compute_c_puct(self, H_v: float, G: float = 0.0) -> float:
+        # Old: c = c₀·(1+H_v) — explored more whenever entropy was high,
+        # even when a dominant move was already forming.
+        # New: c = c₀·(1 + H_v·(1-G)) — only push exploration when
+        # entropy is high AND no move has pulled ahead yet.
+        return self.base_c * (1.0 + H_v * (1.0 - G))
+
 
 
 # ── Layer 7: Budget control ───────────────────────────────────────────────────
@@ -184,10 +193,13 @@ class LambdaBudgetController:
         else:
             phase_mult = 0.8     # endgame — often decided
 
-        if lam > 0.7:
-            lam_mult = 0.7
-        elif lam < 0.3:
-            lam_mult = 1.3
+        # Softened thresholds — old 0.7/1.3 at λ>0.7 caused double compression
+        # (high λ → trust heuristic + cut budget simultaneously).
+        # With λ commonly 0.75+, system was almost always at 70% budget.
+        if lam > 0.8:
+            lam_mult = 0.85
+        elif lam < 0.4:
+            lam_mult = 1.15
         else:
             lam_mult = 1.0
 
@@ -293,7 +305,7 @@ class TopologyAwareMCTS:
         enable_soft_pruning:       bool = True,
         enable_dynamic_lambda:     bool = True,
         enable_dynamic_exploration:bool = True,
-        enable_early_stop:         bool = True,
+        enable_early_stop:         bool = False,
         enable_lambda_budget:      bool = True,
         enable_logging:            bool = False,
         log_file:          Optional[str] = None,
@@ -379,12 +391,14 @@ class TopologyAwareMCTS:
 
         # ── Build root (reused for probe + main search) ───────────────────────
         root = MCTSNode(game_state=game.copy())
+        local_simulations = 0   # per-search counter — does NOT accumulate across moves
 
         # ── Layer 7: Budget (probe on real root, sims count toward total) ─────
         if self.budget_ctrl:
-            PROBE = 100
+            PROBE = 50   # was 100 — 25% of budget was too much pre-shaping
             for _ in range(PROBE):
                 self._simulate(root, prior_probs, lam=0.0, c_puct=1.414)
+                local_simulations += 1
             probe_m = self.tree_metrics.compute(root)
             probe_lam = self.lam_ctrl.compute_lambda(
                 probe_m['visit_entropy'],
@@ -412,13 +426,15 @@ class TopologyAwareMCTS:
         for i in range(remaining):
             if i > 0 and i % self.METRICS_INTERVAL == 0:
                 refresh()
-            # Layer 6: early stop
-            if self.use_early_stop and i > 100 and self._should_stop(metrics):
+            # Layer 6: early stop — minimum 250 total sims before allowed
+            if self.use_early_stop and local_simulations > 250 and self._should_stop(metrics):
                 break
             self._simulate(root, prior_probs, cur_lam, cur_c)
-            self.total_simulations += 1
+            local_simulations      += 1
+            self.total_simulations += 1   # global stat only — not used for per-move reporting
 
         refresh()  # final signals for logging/stats
+
 
         # ── Layer 8: Log ──────────────────────────────────────────────────────
         if self.logger:
@@ -442,13 +458,14 @@ class TopologyAwareMCTS:
         policy_target = visits / (visits.sum() + 1e-8)
 
         stats = {
-            'simulations': self.total_simulations,
-            'tactical':    False,
-            'lambda_h':    cur_lam,
-            'H_v':         metrics['visit_entropy'],
-            'G':           metrics['dominance_gap'],
-            'Var_Q':       metrics['value_variance'],
-            'budget':      budget,
+            'simulations':       local_simulations,   # per-move, not cumulative
+            'total_simulations': self.total_simulations,  # game-level aggregate
+            'tactical':          False,
+            'lambda_h':          cur_lam,
+            'H_v':               metrics['visit_entropy'],
+            'G':                 metrics['dominance_gap'],
+            'Var_Q':             metrics['value_variance'],
+            'budget':            budget,
         }
 
         if return_record:
@@ -499,7 +516,7 @@ class TopologyAwareMCTS:
             n.visit_count += 1
             n.value_sum   += value
             value = -value   # flip perspective each level
-
+        root.visit_count += 1   # root must be counted or parent_visits=0 breaks UCB
     def _select(self, node: MCTSNode, lambda_h: float, c_puct: float) -> MCTSNode:
         """
         Layer 2: PUCT + λ·h_astar.
@@ -577,7 +594,9 @@ class TopologyAwareMCTS:
 
     def _c(self, m: Dict) -> float:
         if self.dyn_explore is None: return 1.414
-        return self.dyn_explore.compute_c_puct(m['visit_entropy'])
+        return self.dyn_explore.compute_c_puct(
+            m['visit_entropy'], m['dominance_gap']
+        )
 
     def _make_record(self, game: ReversiGame, player: int,
                      policy: np.ndarray) -> SelfPlayRecord:

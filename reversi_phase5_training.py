@@ -68,8 +68,10 @@ def get_config() -> argparse.Namespace:
     # Network
     p.add_argument('--channels',            type=int,   default=128)
     p.add_argument('--lr',                  type=float, default=2e-3)
-    p.add_argument('--lr-decay',            type=float, default=0.97,
+    p.add_argument('--lr-decay',            type=float, default=0.99,
                    help='LR multiplied by this each iteration')
+    p.add_argument('--lr-warmup-iters',     type=int,   default=3,
+                   help='Linear warmup from lr/10 to lr over N iters')
     p.add_argument('--weight-decay',        type=float, default=1e-4)
 
     # Replay buffer
@@ -93,6 +95,8 @@ def get_config() -> argparse.Namespace:
     p.add_argument('--recal-interval',      type=int,   default=5)
     p.add_argument('--probe-budget',        type=int,   default=200)
     p.add_argument('--probe-positions',     type=int,   default=300)
+    p.add_argument('--target-stop-rate',    type=float, default=0.25,
+                   help='Target early-stop rate for threshold calibration (default: 0.25)')
 
     # Checkpoints / logging
     p.add_argument('--checkpoint-dir',      type=str,   default='checkpoints')
@@ -117,8 +121,10 @@ class ReplayBuffer(Dataset):
 
     def push(self, records: List[SelfPlayRecord]):
         for r in records:
-            if r.value_target == 0.0 and r.policy_target.sum() == 0:
-                continue  # skip incomplete records
+            # Skip only truly incomplete records — policy must have mass
+            # Don't skip draws (value_target=0 is valid for drawn games)
+            if r.policy_target.sum() < 0.99:
+                continue
             self._buf.append((
                 torch.from_numpy(r.board_tensor).float(),
                 torch.from_numpy(r.policy_target).float(),
@@ -184,18 +190,25 @@ def selfplay_worker(
     while True:
         # Non-blocking weight check — drain queue to get latest weights
         latest_state = None
-        while not weight_queue.empty():
-            try:
+        try:
+            while True:
                 latest_state = weight_queue.get_nowait()
-            except Exception:
-                break
+        except:
+            pass
 
         if latest_state == 'STOP':
             break
 
         if latest_state is not None:
-            net.load_state_dict(latest_state)
-            net.eval()
+            if isinstance(latest_state, dict) and 'weights' in latest_state:
+                net.load_state_dict(latest_state['weights'])
+                net.eval()
+                if 'thresholds' in latest_state:
+                    mcts.set_thresholds(latest_state['thresholds'])
+            else:
+                # Backward compatibility with bare state_dict
+                net.load_state_dict(latest_state)
+                net.eval()
 
         # Play one complete game
         records = _play_game(mcts, net, config_dict)
@@ -275,16 +288,15 @@ def train_step(
             value_targets  = value_targets.to(device).unsqueeze(1)
 
             policy_logits, value_pred = net(boards)
-
             # Policy: cross-entropy vs MCTS visit distribution
-            # Log-softmax + KL is equivalent to CE here
             log_probs    = torch.log_softmax(policy_logits, dim=1)
             policy_loss  = -(policy_targets * log_probs).sum(dim=1).mean()
 
-            # Value: MSE
+            # Value: MSE — weighted 0.5 (standard AlphaZero practice)
+            # prevents value head from dominating gradient when policy is noisy
             value_loss   = nn.functional.mse_loss(value_pred, value_targets)
 
-            loss = policy_loss + value_loss
+            loss = policy_loss + 0.5 * value_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -298,9 +310,9 @@ def train_step(
 
     net.eval()
     return {
-        'policy_loss': np.mean(policy_losses),
-        'value_loss':  np.mean(value_losses),
-        'total_loss':  np.mean(total_losses),
+        'policy_loss': float(np.mean(policy_losses)),
+        'value_loss':  float(np.mean(value_losses)),
+        'total_loss':  float(np.mean(total_losses)),
     }
 
 
@@ -326,7 +338,7 @@ def save_checkpoint(
 
 
 def load_checkpoint(path: str, net: CompactReversiNet, optimizer: optim.Optimizer):
-    ckpt = torch.load(path, map_location='cpu')
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
     net.load_state_dict(ckpt['model_state_dict'])
     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
     return ckpt['iteration'], ckpt.get('thresholds', {}), ckpt.get('log', [])
@@ -352,6 +364,7 @@ def main():
     print(f"  Buffer size:    {cfg.buffer_size:,}")
     print(f"  Batch size:     {cfg.batch_size}")
     print(f"  LR:             {cfg.lr}")
+    print(f"  Target stop %%:  {cfg.target_stop_rate*100:.0f}%%")
     print(f"{'='*65}\n")
 
     # Setup
@@ -361,12 +374,18 @@ def main():
 
     net       = CompactReversiNet(8, cfg.channels).to(device)
     optimizer = optim.Adam(net.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.lr_decay)
     buffer    = ReplayBuffer(cfg.buffer_size)
     log       = []
     start_iter = 1
     thresholds = {'H_v_thresh': 0.20, 'G_thresh': 0.50, 'Var_Q_thresh': 0.02}
+    def lr_lambda(iteration):
+        # iteration is 0-indexed — scheduler.step() called once per training iter
+        if iteration < cfg.lr_warmup_iters:
+            return (iteration + 1) / cfg.lr_warmup_iters   # linear warmup
+        decay_iters = iteration - cfg.lr_warmup_iters
+        return cfg.lr_decay ** decay_iters
 
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     # Resume
     if cfg.resume:
         print(f"  Resuming from {cfg.resume}")
@@ -390,13 +409,16 @@ def main():
         probe_budget=cfg.probe_budget,
         recal_interval=cfg.recal_interval,
         num_positions=cfg.probe_positions,
+        target_stop_rate=cfg.target_stop_rate,
         save_dir=str(ckpt_dir / 'calibrations'),
     )
 
     if not cfg.resume:
         thresholds = recalibrator.initial_calibrate(verbose=True)
     else:
-        recalibrator.history.append(None)  # skip initial, treat as already done
+        # On resume: seed history with a stub so should_recalibrate() uses the
+        # interval counter correctly (avoids immediate recal before first train step).
+        recalibrator._last_recal_iter = start_iter - 1
 
     # ── Multiprocessing setup ─────────────────────────────────────────────────
     ctx          = mp.get_context('spawn')
@@ -419,11 +441,12 @@ def main():
         p.start()
         workers.append(p)
 
-    # Push initial weights to all workers
+    # Push initial weights + thresholds to all workers
     state = {k: v.cpu() for k, v in net.state_dict().items()}
+    payload = {'weights': state, 'thresholds': thresholds}
     for q in weight_queues:
         try:
-            q.put_nowait(state)
+            q.put_nowait(payload)
         except Exception:
             pass
 
@@ -451,12 +474,13 @@ def main():
                 games_collected     += 1
                 records_this_iter   += len(records)
 
-                # Push updated weights periodically
+                # Push updated weights + thresholds periodically
                 if games_collected % cfg.weight_push_interval == 0:
                     state = {k: v.cpu() for k, v in net.state_dict().items()}
+                    payload = {'weights': state, 'thresholds': thresholds}
                     for q in weight_queues:
                         try:
-                            q.put_nowait(state)
+                            q.put_nowait(payload)
                         except Exception:
                             pass   # queue full — worker will catch it next round
 
@@ -486,15 +510,20 @@ def main():
             num_workers=0,    # in main process — buffer isn't fork-safe
             drop_last=True,
         )
+        effective_steps = cfg.train_steps
+        if len(buffer) >= cfg.buffer_size * 0.95:
+            effective_steps = min(cfg.train_steps + len(buffer)//5000, cfg.train_steps*2)
 
         train_start = time.time()
-        losses = train_step(net, optimizer, loader, device, cfg.train_steps)
+        losses = train_step(net, optimizer, loader, device, effective_steps)
+
         scheduler.step()
         train_time = time.time() - train_start
 
         print(f"  Train: policy={losses['policy_loss']:.4f}  "
               f"value={losses['value_loss']:.4f}  "
               f"total={losses['total_loss']:.4f}  "
+              f"steps={effective_steps}  "
               f"lr={scheduler.get_last_lr()[0]:.2e}  "
               f"time={train_time:.1f}s")
 
@@ -502,12 +531,12 @@ def main():
         recalibrator.update_network(net)
         if recalibrator.should_recalibrate(iteration):
             thresholds = recalibrator.recalibrate(iteration)
-            # Push new thresholds to workers via config update
-            # (workers will pick up new weights which embed updated behaviour)
+            # Push new weights + thresholds to workers immediately
             state = {k: v.cpu() for k, v in net.state_dict().items()}
+            payload = {'weights': state, 'thresholds': thresholds}
             for q in weight_queues:
                 try:
-                    q.put_nowait(state)
+                    q.put_nowait(payload)
                 except Exception:
                     pass
 
@@ -520,10 +549,13 @@ def main():
             'policy_loss':    losses['policy_loss'],
             'value_loss':     losses['value_loss'],
             'total_loss':     losses['total_loss'],
+            'train_steps':    effective_steps,
             'lr':             scheduler.get_last_lr()[0],
             'H_v_thresh':     thresholds['H_v_thresh'],
             'G_thresh':       thresholds['G_thresh'],
             'Var_Q_thresh':   thresholds['Var_Q_thresh'],
+            'stop_rate':      recalibrator.history[-1].expected_stop_rate if recalibrator.history else None,
+            'target_stop_rate': cfg.target_stop_rate,
             'iter_time':      round(time.time() - iter_start, 1),
         }
         log.append(iter_log)

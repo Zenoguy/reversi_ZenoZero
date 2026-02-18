@@ -123,11 +123,13 @@ class ThresholdCalibrator:
         pattern_heuristic:PatternHeuristic,
         probe_budget:     int = 200,
         device:           Optional[torch.device] = None,
+        target_stop_rate: float = 0.25,
     ):
         self.net       = network
         self.solver    = tactical_solver
         self.heuristic = pattern_heuristic
         self.probe_budget = probe_budget
+        self.target_stop_rate = target_stop_rate
         self.device    = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.net.to(self.device)
         self.net.eval()
@@ -190,6 +192,7 @@ class ThresholdCalibrator:
             h_vs, gs, var_qs,
             num_positions=len(h_vs),
             training_iteration=training_iteration,
+            target_stop_rate=self.target_stop_rate,
         )
 
         if verbose:
@@ -350,20 +353,83 @@ class ThresholdCalibrator:
     # ── Threshold computation ─────────────────────────────────────────────────
 
     @staticmethod
+    def _joint_stop_rate(
+        h: np.ndarray,
+        g: np.ndarray,
+        v: np.ndarray,
+        p: float,
+    ) -> float:
+        """
+        Given a single percentile parameter p ∈ [0, 100], compute thresholds as:
+          H_v_thresh   = percentile(h, p)       — stop if H_v   < this  (low entropy)
+          G_thresh     = percentile(g, 100-p)   — stop if G     > this  (high gap)
+          Var_Q_thresh = percentile(v, p)       — stop if Var_Q < this  (low variance)
+
+        As p increases all three conditions become easier to satisfy, so the
+        joint stop rate is monotonically non-decreasing in p.  This makes it
+        trivial to binary-search for a target rate.
+        """
+        h_t = float(np.percentile(h, p))
+        g_t = float(np.percentile(g, 100.0 - p))
+        v_t = float(np.percentile(v, p))
+        return float(((h < h_t) & (g > g_t) & (v < v_t)).mean())
+
+    @staticmethod
+    def _solve_percentile(
+        h: np.ndarray,
+        g: np.ndarray,
+        v: np.ndarray,
+        target_rate: float = 0.25,
+        tol: float = 0.005,
+        max_iter: int = 60,
+    ) -> float:
+        """
+        Binary-search for the percentile p that yields joint stop rate ≈ target_rate.
+        Returns the solved p value.
+        """
+        lo, hi = 0.0, 100.0
+
+        # Quick sanity: if even p=100 can't reach target (all metrics perfectly
+        # correlated but still < target), just return 100 and let caller warn.
+        if ThresholdCalibrator._joint_stop_rate(h, g, v, 100.0) < target_rate:
+            return 100.0
+
+        for _ in range(max_iter):
+            mid = (lo + hi) / 2.0
+            rate = ThresholdCalibrator._joint_stop_rate(h, g, v, mid)
+            if abs(rate - target_rate) < tol:
+                return mid
+            if rate < target_rate:
+                lo = mid
+            else:
+                hi = mid
+        return (lo + hi) / 2.0
+
+    @staticmethod
     def _compute_result(
         h_vs: List[float],
         gs:   List[float],
         var_qs: List[float],
         num_positions: int,
         training_iteration: int,
+        target_stop_rate: float = 0.25,
     ) -> CalibrationResult:
         h  = np.array(h_vs);  g = np.array(gs);  v = np.array(var_qs)
 
-        H_v_thresh   = float(np.percentile(h, 25))
-        G_thresh     = float(np.percentile(g, 75))
-        Var_Q_thresh = float(np.percentile(v, 25))
+        # ── Numerically solve for the percentile p that achieves the target ──
+        # Instead of setting each threshold at its individual p25/p75 (which
+        # gives a joint AND-rate of only ~6-10% due to metric correlation), we
+        # binary-search a single shared percentile p so the *joint* condition
+        # fires at exactly target_stop_rate.
+        p_solved = ThresholdCalibrator._solve_percentile(
+            h, g, v, target_rate=target_stop_rate
+        )
 
-        # What fraction would trigger early stop with these thresholds?
+        H_v_thresh   = float(np.percentile(h, p_solved))
+        G_thresh     = float(np.percentile(g, 100.0 - p_solved))
+        Var_Q_thresh = float(np.percentile(v, p_solved))
+
+        # Verify the achieved rate (should be ≈ target_stop_rate)
         stop_mask = (h < H_v_thresh) & (g > G_thresh) & (v < Var_Q_thresh)
         stop_rate = float(stop_mask.mean())
 
@@ -393,12 +459,11 @@ class ThresholdCalibrator:
     @staticmethod
     def _print_result(r: CalibrationResult, elapsed: float = 0.0):
         print(f"\n{'─'*65}")
-        print(f"  THRESHOLDS TO INJECT:")
+        print(f"  THRESHOLDS TO INJECT:  (joint binary-search, target=25%)")
         print(f"    H_v   < {r.H_v_thresh:.4f}   (entropy — current median {r.H_v_p50:.4f})")
         print(f"    G     > {r.G_thresh:.4f}   (gap     — current median {r.G_p50:.4f})")
         print(f"    Var_Q < {r.Var_Q_thresh:.4f}   (variance — current median {r.Var_Q_p50:.4f})")
-        print(f"\n  EXPECTED EARLY-STOP RATE: {r.expected_stop_rate*100:.1f}% of positions")
-        print(f"  (target ~25% — if far off, model strength may have shifted)")
+        print(f"\n  ACHIEVED EARLY-STOP RATE: {r.expected_stop_rate*100:.1f}% of positions  (target 25%)")
         print(f"\n  DISTRIBUTIONS:")
         print(f"    H_v   {r.H_v_p25:.3f} / {r.H_v_p50:.3f} / {r.H_v_p75:.3f}  "
               f"(p25/p50/p75)  std={r.H_v_std:.3f}")
@@ -445,13 +510,15 @@ class DynamicRecalibrator:
         tactical_solver:   TacticalSolver,
         pattern_heuristic: PatternHeuristic,
         probe_budget:      int   = 200,
-        recal_interval:    int   = 5,     # iterations between automatic recals
-        drift_threshold:   float = 0.10,  # 10% mean shift triggers recal
+        recal_interval:    int   = 5,
+        drift_threshold:   float = 0.10,
         num_positions:     int   = 300,
+        target_stop_rate:  float = 0.25,
         save_dir:          str   = 'calibrations',
     ):
         self.calibrator = ThresholdCalibrator(
-            network, tactical_solver, pattern_heuristic, probe_budget
+            network, tactical_solver, pattern_heuristic,
+            probe_budget, target_stop_rate=target_stop_rate,
         )
         self.calibrator.probe_budget = probe_budget
 
@@ -596,7 +663,23 @@ class DynamicRecalibrator:
     def _print_delta(self):
         if len(self.history) < 2:
             return
+
         prev, curr = self.history[-2], self.history[-1]
+
+        # Resume case: previous calibration missing
+        if prev is None:
+            print("\n  THRESHOLD DELTA: (no previous calibration — resume case)")
+            return
+
+        print(f"\n  THRESHOLD DELTA (prev → current):")
+        print(f"    H_v_thresh   {prev.H_v_thresh:.4f} → {curr.H_v_thresh:.4f}  "
+            f"({'↑' if curr.H_v_thresh > prev.H_v_thresh else '↓'})")
+        print(f"    G_thresh     {prev.G_thresh:.4f} → {curr.G_thresh:.4f}  "
+            f"({'↑' if curr.G_thresh > prev.G_thresh else '↓'})")
+        print(f"    Var_Q_thresh {prev.Var_Q_thresh:.4f} → {curr.Var_Q_thresh:.4f}  "
+            f"({'↑' if curr.Var_Q_thresh > prev.Var_Q_thresh else '↓'})")
+        print(f"    Stop rate    {prev.expected_stop_rate*100:.1f}% → "
+            f"{curr.expected_stop_rate*100:.1f}%")
         print(f"\n  THRESHOLD DELTA (prev → current):")
         print(f"    H_v_thresh   {prev.H_v_thresh:.4f} → {curr.H_v_thresh:.4f}  "
               f"({'↑' if curr.H_v_thresh > prev.H_v_thresh else '↓'})")

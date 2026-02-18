@@ -114,9 +114,11 @@ class PureMCTS:
 
         # ── MCTS ──────────────────────────────────────────────────────────────
         root = MCTSNode(game_state=game.copy())
+        local_simulations = 0
 
         for _ in range(self.BUDGET):
             self._simulate(root, prior)
+            local_simulations      += 1
             self.total_simulations += 1
 
         # ── Policy target ─────────────────────────────────────────────────────
@@ -135,10 +137,11 @@ class PureMCTS:
         policy_target = visits / (visits.sum() + 1e-8)
 
         stats = {
-            'simulations': self.total_simulations,
-            'tactical':    False,
-            'budget':      self.BUDGET,
-            'c_puct':      self.C_PUCT,
+            'simulations':       local_simulations,
+            'total_simulations': self.total_simulations,
+            'tactical':          False,
+            'budget':            self.BUDGET,
+            'c_puct':            self.C_PUCT,
         }
 
         if return_record:
@@ -178,6 +181,8 @@ class PureMCTS:
             n.visit_count += 1
             n.value_sum   += value
             value = -value
+        root.visit_count += 1   # same fix as topology system
+
 
 
 # Replace PureMCTS._select:

@@ -46,7 +46,11 @@ from reversi_phase5_topology_layers import TopologyAwareMCTS
 from reversi_phase5_baseline import PureMCTS
 from reversi_phase5_dynamic_threshold_recalibrator import DynamicRecalibrator
 
-
+from reversi_phase5_topology_core import (
+    ReversiGame, TacticalSolver, PatternHeuristic, CompactReversiNet
+)
+from reversi_phase5_topology_layers import TopologyAwareMCTS
+from reversi_phase5_baseline import PureMCTS
 # ── Config ────────────────────────────────────────────────────────────────────
 
 def get_config() -> argparse.Namespace:
@@ -65,6 +69,12 @@ def get_config() -> argparse.Namespace:
     p.add_argument('--topology-budget', type=int, default=400,
                    help='Base budget for topology MCTS (adapts dynamically)')
     p.add_argument('--output',      type=str,  default='benchmark_results.json')
+    p.add_argument('--parallel-games',  action='store_true',
+                   help='Run benchmark games in parallel (cpu_count//2-1 workers)')
+    p.add_argument('--baseline-vs-baseline', action='store_true',
+                   help='Also run fixed-800 vs fixed-N to isolate compute effect')
+    p.add_argument('--compute-control-budget', type=int, default=400,
+                   help='Budget for baseline-vs-baseline compute control run')
     return p.parse_args()
 
 
@@ -83,6 +93,7 @@ class GameResult:
     baseline_tactical:   int
     topology_avg_lambda: float
     topology_avg_H_v:    float
+    avg_kl_divergence: float
 
 
 @dataclass
@@ -104,6 +115,7 @@ class MatchupResult:
     avg_H_v:            float
     p_value:            float   # binomial test vs 50% win rate
     significant:        bool    # p < 0.05
+    avg_kl_divergence: float
 
 
 # ── Single game ───────────────────────────────────────────────────────────────
@@ -127,6 +139,7 @@ def play_game(
     baseline_tactic = 0
     lambda_vals     = []
     h_v_vals        = []
+    kl_divs         = []   # KL(topology_policy || baseline_policy) per move
     move_num        = 0
 
     while not game.game_over:
@@ -137,7 +150,11 @@ def play_game(
             continue
 
         if game.current_player == topology_player:
-            move, _, stats = topology_mcts.search(
+            move, top_policy, stats = topology_mcts.search(
+                game, temperature=temperature, add_dirichlet=False
+            )
+            # Also get baseline policy for KL — same position, don't advance game
+            _, base_policy, _ = baseline_mcts.search(
                 game, temperature=temperature, add_dirichlet=False
             )
             topology_sims   += stats.get('simulations', 0)
@@ -145,6 +162,11 @@ def play_game(
             if not stats.get('tactical', False):
                 lambda_vals.append(stats.get('lambda_h', 0.0))
                 h_v_vals.append(stats.get('H_v', 0.0))
+                # KL(topology || baseline) — how different are the policies?
+                p = top_policy + 1e-10;  p /= p.sum()
+                q = base_policy + 1e-10; q /= q.sum()
+                kl = float(np.sum(p * np.log(p / q)))
+                kl_divs.append(kl)
         else:
             move, _, stats = baseline_mcts.search(
                 game, temperature=temperature, add_dirichlet=False
@@ -169,6 +191,8 @@ def play_game(
         baseline_tactical=baseline_tactic,
         topology_avg_lambda=float(np.mean(lambda_vals)) if lambda_vals else 0.0,
         topology_avg_H_v=float(np.mean(h_v_vals)) if h_v_vals else 0.0,
+        avg_kl_divergence=float(np.mean(kl_divs)) if kl_divs else 0.0,
+
     )
 
 
@@ -230,6 +254,7 @@ def run_matchup(
     # Binomial test: is win rate significantly different from 50%?
     binom = scipy_stats.binomtest(wins, num_games, p=0.5, alternative='two-sided')
 
+    avg_kl = float(np.mean([r.avg_kl_divergence for r in results]))
     # Tactical rate across all topology moves
     total_top_moves   = sum(r.game_length for r in results) // 2
     total_top_tactic  = sum(r.topology_tactical for r in results)
@@ -250,7 +275,8 @@ def run_matchup(
         avg_lambda=float(np.mean([r.topology_avg_lambda for r in results])),
         avg_H_v=float(np.mean([r.topology_avg_H_v for r in results])),
         p_value=float(binom.pvalue),
-        significant=(binom.pvalue < 0.05),
+        significant=bool(binom.pvalue < 0.05),
+        avg_kl_divergence=avg_kl,
     )
 
 
@@ -328,9 +354,224 @@ def print_result(r: MatchupResult):
           f"savings={r.sim_savings_pct:+.1f}%")
     print(f"  │  Game length={r.avg_game_length:.1f}  "
           f"tactical_rate={r.avg_tactical_rate:.1%}")
-    print(f"  └  λ̄={r.avg_lambda:.3f}  H̄_v={r.avg_H_v:.3f}")
+    print(f"  └  λ̄={r.avg_lambda:.3f}  H̄_v={r.avg_H_v:.3f}  KL={r.avg_kl_divergence:.4f}")
+
+def worker_fn(worker_games, start_idx, result_q,
+              state_dict,
+              thresholds,
+              topology_config,
+              baseline_budget,
+              temperature):
+
+    from reversi_phase5_topology_core import (
+        ReversiGame, TacticalSolver, PatternHeuristic, CompactReversiNet
+    )
+    from reversi_phase5_topology_layers import TopologyAwareMCTS
+    from reversi_phase5_baseline import PureMCTS
+
+    # Recreate network locally
+    net = CompactReversiNet(8, 128)
+    net.load_state_dict(state_dict)
+    net.eval()
+
+    top_mcts = TopologyAwareMCTS(
+        network=net,
+        tactical_solver=TacticalSolver(),
+        pattern_heuristic=PatternHeuristic(),
+        **topology_config,
+    )
+    top_mcts.set_thresholds(thresholds)
+
+    base_mcts = PureMCTS(
+        network=net,
+        tactical_solver=TacticalSolver(),
+        use_tactical=True,
+    )
+    base_mcts.__class__.BUDGET = baseline_budget
+
+    results = []
+
+    for i in range(worker_games):
+        tib = ((start_idx + i) % 2 == 0)
+        r = play_game(top_mcts, base_mcts, tib, temperature)
+        results.append(r)
+
+    result_q.put(results)
+
+def run_matchup_parallel(
+    name:           str,
+    net:            CompactReversiNet,
+    thresholds:     dict,
+    num_games:      int,
+    temperature:    float,
+    baseline_budget:int,
+    topology_config:dict,
+    num_workers:    int,
+) -> MatchupResult:
+    """
+    Parallel version of run_matchup.
+    Splits games across workers, each worker runs its slice sequentially.
+    Safe because games are fully independent and network is read-only (inference).
+    """
+    import multiprocessing as mp
+    from functools import partial
+
+    games_per_worker = [num_games // num_workers] * num_workers
+    for i in range(num_games % num_workers):
+        games_per_worker[i] += 1
+
+    # Offset game indices so colour alternation stays correct across workers
+    offsets = [sum(games_per_worker[:i]) for i in range(num_workers)]
+
+    ctx = mp.get_context('fork')
 
 
+
+    result_q = ctx.Queue()
+    procs = []
+    for wid in range(num_workers):
+        p = ctx.Process(
+            target=worker_fn,
+            args=(
+                games_per_worker[wid],
+                offsets[wid],
+                result_q,
+                net.state_dict(),
+                thresholds,
+                topology_config,
+                baseline_budget,
+                temperature,
+            ),
+        )
+
+        p.start()
+        procs.append(p)
+
+    all_results = []
+    for _ in range(num_workers):
+        all_results.extend(result_q.get(timeout=7200))
+    for p in procs:
+        p.join(timeout=30)
+
+    # Aggregate exactly as run_matchup does
+    wins   = sum(r.topology_win  for r in all_results)
+    draws  = sum(r.topology_draw for r in all_results)
+    losses = num_games - wins - draws
+    avg_top_sims  = np.mean([r.topology_sims  for r in all_results])
+    avg_base_sims = np.mean([r.baseline_sims  for r in all_results])
+    sim_savings   = (avg_base_sims - avg_top_sims) / (avg_base_sims + 1e-8) * 100
+    binom = scipy_stats.binomtest(wins, num_games, p=0.5, alternative='two-sided')
+    total_top_moves  = sum(r.game_length for r in all_results) // 2
+    total_top_tactic = sum(r.topology_tactical for r in all_results)
+    tactic_rate      = total_top_tactic / (total_top_moves + 1e-8)
+    lambda_vals = [r.topology_avg_lambda for r in all_results]
+    h_v_vals    = [r.topology_avg_H_v    for r in all_results]
+    kl_vals     = [r.avg_kl_divergence   for r in all_results]
+
+    return MatchupResult(
+        name=name, games=num_games,
+        wins=wins, draws=draws, losses=losses,
+        win_rate=wins/num_games, draw_rate=draws/num_games, loss_rate=losses/num_games,
+        avg_sims_topology=float(avg_top_sims),
+        avg_sims_baseline=float(avg_base_sims),
+        sim_savings_pct=float(sim_savings),
+        avg_game_length=float(np.mean([r.game_length for r in all_results])),
+        avg_tactical_rate=float(tactic_rate),
+        avg_lambda=float(np.mean(lambda_vals)),
+        avg_H_v=float(np.mean(h_v_vals)),
+        avg_kl_divergence=float(np.mean(kl_vals)),
+        p_value=float(binom.pvalue),
+        significant=bool(binom.pvalue < 0.05),
+    )
+
+
+def run_baseline_vs_baseline(
+    net:           CompactReversiNet,
+    num_games:     int,
+    temperature:   float,
+    budget_a:      int,   # "strong" baseline
+    budget_b:      int,   # "weak" baseline (compute-matched to ZenoZero)
+) -> MatchupResult:
+    """
+    Pits Baseline-A (budget_a sims) against Baseline-B (budget_b sims).
+    Reported from Baseline-B's perspective so you can compare directly
+    with ZenoZero's win rate against Baseline-A.
+
+    This answers: is ZenoZero better than just running fewer sims?
+    If ZenoZero beats Baseline-A at 52% but Baseline-B only beats
+    Baseline-A at 43%, ZenoZero's topology is adding real value.
+    """
+    from reversi_phase5_baseline import PureMCTS
+
+    class BaselineA(PureMCTS):
+        BUDGET = budget_a
+    class BaselineB(PureMCTS):
+        BUDGET = budget_b
+
+    mcts_a = BaselineA(net, TacticalSolver())
+    mcts_b = BaselineB(net, TacticalSolver())
+
+    results = []
+    for i in range(num_games):
+        b_is_black = (i % 2 == 0)
+        # Reuse play_game — treat B as "topology" and A as "baseline"
+        game = ReversiGame()
+        b_player = 1 if b_is_black else -1
+        b_sims = 0; a_sims = 0
+        b_tactic = 0; a_tactic = 0
+        move_num = 0
+        while not game.game_over:
+            legal = game.get_legal_moves()
+            if not legal:
+                game.make_move(None); move_num += 1; continue
+            if game.current_player == b_player:
+                move, _, stats = mcts_b.search(game, temperature=temperature)
+                b_sims   += stats.get('simulations', 0)
+                b_tactic += int(stats.get('tactical', False))
+            else:
+                move, _, stats = mcts_a.search(game, temperature=temperature)
+                a_sims   += stats.get('simulations', 0)
+                a_tactic += int(stats.get('tactical', False))
+            game.make_move(move); move_num += 1
+
+        results.append(GameResult(
+            winner=game.winner,
+            topology_player=b_player,
+            topology_win=(game.winner == b_player),
+            topology_draw=(game.winner == 0),
+            game_length=move_num,
+            topology_sims=b_sims,
+            baseline_sims=a_sims,
+            topology_tactical=b_tactic,
+            baseline_tactical=a_tactic,
+            topology_avg_lambda=0.0,
+            topology_avg_H_v=0.0,
+            avg_kl_divergence=0.0,
+        ))
+
+    wins   = sum(r.topology_win  for r in results)
+    draws  = sum(r.topology_draw for r in results)
+    losses = num_games - wins - draws
+    avg_b  = np.mean([r.topology_sims for r in results])
+    avg_a  = np.mean([r.baseline_sims for r in results])
+    sim_savings = (avg_a - avg_b) / (avg_a + 1e-8) * 100
+    binom = scipy_stats.binomtest(wins, num_games, p=0.5, alternative='two-sided')
+
+    return MatchupResult(
+        name=f"Baseline-{budget_b} vs Baseline-{budget_a} (compute control)",
+        games=num_games, wins=wins, draws=draws, losses=losses,
+        win_rate=wins/num_games, draw_rate=draws/num_games, loss_rate=losses/num_games,
+        avg_sims_topology=float(avg_b),
+        avg_sims_baseline=float(avg_a),
+        sim_savings_pct=float(sim_savings),
+        avg_game_length=float(np.mean([r.game_length for r in results])),
+        avg_tactical_rate=0.0,
+        avg_lambda=0.0,
+        avg_H_v=0.0,
+        avg_kl_divergence=0.0,
+        p_value=float(binom.pvalue),
+        significant=bool(binom.pvalue < 0.05),
+    )
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -398,7 +639,9 @@ def main():
     print(f"{'─'*65}")
 
     t0 = time.time()
-    main_result = run_matchup(
+    runner = run_matchup_parallel if cfg.parallel_games else run_matchup
+
+    main_result = runner(
         name="Full Topology vs Baseline",
         net=net,
         thresholds=thresholds,
@@ -406,7 +649,9 @@ def main():
         temperature=cfg.temperature,
         baseline_budget=cfg.baseline_budget,
         topology_config=full_config,
+        **({"num_workers": cfg.workers} if cfg.parallel_games else {}),
     )
+
     print_result(main_result)
     all_results.append(asdict(main_result))
     print(f"\n  Main matchup done in {time.time()-t0:.1f}s")
@@ -423,19 +668,28 @@ def main():
 
         for name, abl_cfg in get_ablation_configs():
             print(f"\n  Testing: {name}")
-            t0 = time.time()
-            r = run_matchup(
-                name=name,
-                net=net,
-                thresholds=thresholds,
-                num_games=ablation_games,
-                temperature=cfg.temperature,
-                baseline_budget=cfg.baseline_budget,
-                topology_config=abl_cfg,
-            )
-            print_result(r)
-            ablation_results.append(asdict(r))
-            print(f"  Done in {time.time()-t0:.1f}s")
+
+    # Compute control: does ZenoZero beat naive budget reduction?
+    if cfg.baseline_vs_baseline:
+        print(f"\n{'─'*65}")
+        print(f"  COMPUTE CONTROL: Baseline-{cfg.compute_control_budget} vs Baseline-{cfg.baseline_budget}")
+        print(f"  (isolates whether ZenoZero adds value beyond just using fewer sims)")
+        print(f"{'─'*65}")
+        ctrl_result = run_baseline_vs_baseline(
+            net=net,
+            num_games=cfg.games,
+            temperature=cfg.temperature,
+            budget_a=cfg.baseline_budget,
+            budget_b=cfg.compute_control_budget,
+        )
+        print_result(ctrl_result)
+        all_results.append(asdict(ctrl_result))
+        print(f"\n  Interpretation:")
+        delta = main_result.win_rate - ctrl_result.win_rate
+        print(f"  ZenoZero WR={main_result.win_rate:.1%}  vs  "
+              f"Naive-reduction WR={ctrl_result.win_rate:.1%}  "
+              f"→ topology adds {delta:+.1%}")
+        print(f"  Done in {time.time()-t0:.1f}s")
 
         all_results.extend(ablation_results)
 
