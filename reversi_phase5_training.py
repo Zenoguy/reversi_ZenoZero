@@ -96,13 +96,17 @@ def get_config() -> argparse.Namespace:
     p.add_argument('--probe-budget',        type=int,   default=200)
     p.add_argument('--probe-positions',     type=int,   default=300)
     p.add_argument('--target-stop-rate',    type=float, default=0.25,
-                   help='Target early-stop rate for threshold calibration (default: 0.25)')
+                   help='Informational only — early stop now uses fixed Strength-First '
+                        'thresholds (H_v<0.15, G>0.85, Var_Q<0.01). This value is '
+                        'logged alongside the actual stop rate for reference.')
 
     # Checkpoints / logging
     p.add_argument('--checkpoint-dir',      type=str,   default='checkpoints')
     p.add_argument('--checkpoint-interval', type=int,   default=5)
     p.add_argument('--log-file',            type=str,   default='training_log.jsonl')
     p.add_argument('--resume',              type=str,   default=None)
+    p.add_argument('--seed',                type=int,   default=42,
+                   help='Main process random seed. Workers use worker_id-based seeds for diversity.')
 
     return p.parse_args()
 
@@ -230,7 +234,10 @@ def _play_game(
     mcts.tactical_moves    = 0
     mcts.total_simulations = 0
     if mcts.lam_ctrl:
-        mcts.lam_ctrl.history.clear()
+        mcts.lam_ctrl.history_heuristic.clear()
+        mcts.lam_ctrl.history_budget.clear()
+        mcts.lam_ctrl.history_explore.clear()
+
     if mcts.budget_ctrl:
         mcts.budget_ctrl.history.clear()
 
@@ -365,7 +372,19 @@ def main():
     print(f"  Batch size:     {cfg.batch_size}")
     print(f"  LR:             {cfg.lr}")
     print(f"  Target stop %%:  {cfg.target_stop_rate*100:.0f}%%")
+    print(f"  Seed:           {cfg.seed}  (workers use worker_id-based seeds)")
     print(f"{'='*65}\n")
+
+    # ── Main process determinism ───────────────────────────────────────────────
+    # Workers are intentionally seeded differently (worker_id * 1000 + time)
+    # to ensure diverse self-play games. Only the main process (training
+    # steps, calibration, checkpointing) is fixed here.
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    torch.cuda.manual_seed_all(cfg.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
 
     # Setup
     device    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

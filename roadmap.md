@@ -28,6 +28,41 @@ Topology-based metareasoning beats naive budget reduction by 30pp. That's not a 
 
 ## What's Problematic
 
+**0. Freeze the Universe (Determinism First)**
+
+Do this **before touching logic**.
+
+### 1️⃣ Global seeding (everywhere)
+
+Add once at program start:
+
+```python
+import random
+import numpy as np
+import torch
+
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+```
+
+Also:
+
+* Disable Dirichlet noise in benchmarking
+* Use `temperature=0` always in evaluation
+* Fix multiprocessing start method:
+
+```python
+mp.set_start_method("spawn", force=True)
+```
+
+
 **1. λ controls too many things at once.**
 
 Right now a single scalar λ modulates:
@@ -76,14 +111,32 @@ Even a sketch derivation (e.g., "if H_v is low, expected regret from trusting he
 
 **4. Early stop is too conservative.**
 
-Three conditions must ALL be met: `H_v < thresh AND G > thresh AND Var_Q < thresh`. In practice, how often does this fire? My guess: <5% of positions. The AND logic makes it rare.
+Replace with Strength-First Rule
 
-**Better:** Weighted combination or soft thresholding.
-```python
-stop_score = w1*(thresh_H - H_v) + w2*(G - thresh_G) + w3*(thresh_Var - Var_Q)
-if stop_score > threshold:
-    stop
-```
+Instead of:
+
+H_v_thresh = percentile(...)
+G_thresh   = percentile(...)
+Var_Q_thresh = percentile(...)
+
+Use fixed conservative thresholds:
+
+self._h_v_thresh   = 0.15   # very low entropy
+self._g_thresh     = 0.85   # huge dominance
+self._var_q_thresh = 0.01   # near-zero variance
+
+Then early stop becomes:
+
+def _should_stop(self, m):
+    return (
+        m['visit_entropy']  < 0.15 and
+        m['dominance_gap']  > 0.85 and
+        m['value_variance'] < 0.01
+    )
+
+And keep your safeguard:
+
+if local_simulations > 250:
 
 Now positions can trigger early stop even if one signal is weak, as long as others are strong.
 
@@ -182,6 +235,39 @@ Train the classifier offline on positions where heuristic agreed/disagreed with 
 ```python
 λ = controller(H_v, G, Var_Q, board_density, piece_count, phase)
 ```
+---
+**11. Remove Recalibrator From Benchmark**
+
+Right now your benchmarks recalibrate every run.
+
+That is a huge source of instability.
+
+### Change:
+
+In benchmark:
+
+* Load thresholds from checkpoint
+* DO NOT run `initial_calibrate()` during benchmarking
+
+Benchmark must use fixed thresholds.
+
+Recalibration belongs only inside training.
+
+---
+
+**12.  Clamp Heuristic Injection**
+
+Inside `_nb_ucb_select`:
+
+Limit heuristic contribution:
+
+```
+effective_lambda = min(lambda_h, 0.6)
+```
+
+Never allow full λ=1.
+
+This prevents heuristic domination.
 
 ---
 
@@ -321,18 +407,41 @@ Trained on positions where heuristic agreed/disagreed with ground truth from dee
 
 ---
 
-**Priority 7: Soft early-stop threshold.**
+**Priority 7: Change Early stop,  Remove percentile targeting completely and Replace with Strength-First Rule.**
+
+
+Instead of:
 
 ```python
-stop_score = (
-    3.0 * max(0, self._h_v_thresh - H_v) +
-    3.0 * max(0, G - self._g_thresh) +
-    2.0 * max(0, self._var_q_thresh - Var_Q)
-)
-return stop_score > 4.0  # tunable threshold
+H_v_thresh = percentile(...)
+G_thresh   = percentile(...)
+Var_Q_thresh = percentile(...)
 ```
 
-Now partial agreement still triggers, not just full AND.
+Use **fixed conservative thresholds**:
+
+```python
+self._h_v_thresh   = 0.15   # very low entropy
+self._g_thresh     = 0.85   # huge dominance
+self._var_q_thresh = 0.01   # near-zero variance
+```
+
+Then early stop becomes:
+
+```python
+def _should_stop(self, m):
+    return (
+        m['visit_entropy']  < 0.15 and
+        m['dominance_gap']  > 0.85 and
+        m['value_variance'] < 0.01
+    )
+```
+
+And keep your safeguard:
+
+```python
+if local_simulations > 250:
+```
 
 ---
 

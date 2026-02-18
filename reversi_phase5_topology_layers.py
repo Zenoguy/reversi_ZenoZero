@@ -110,59 +110,96 @@ class TreeMetrics:
 
 class LambdaController:
     """
-    Deterministic λ = f(H_v, G, Var_Q).
+    Three decoupled λ channels — each drives a different control decision.
 
-    Logic:
-      Low H_v  → tree concentrated    → trust heuristic
-      High G   → dominant move exists → trust heuristic
-      Low Var_Q → stable evaluations  → trust heuristic
+    λ_heuristic → Layer 2: how much to weight h_astar in UCB selection
+    λ_budget    → Layer 7: how much to scale search budget
+    λ_explore   → Layer 5: feeds DynamicExploration to set c_puct
 
-    Clipped to [0, 1].  Phase 5.5: replace with small MLP trained from logs.
+    Keeping them separate means ablation can isolate each independently.
+    Phase 5.5: replace each with a head of a shared MLP trained from logs.
     """
 
     def __init__(self):
-        self.history: List[float] = []
+        self.history_heuristic: List[float] = []
+        self.history_budget:    List[float] = []
+        self.history_explore:   List[float] = []
 
-    def compute_lambda(self, H_v: float, G: float, Var_Q: float) -> float:
+    def compute_lambda_heuristic(self, H_v: float, G: float, Var_Q: float) -> float:
+        """
+        Layer 2 weight. High when tree is concentrated (low H_v), dominant
+        move exists (high G), and evaluations agree (low Var_Q).
+        """
         var_term = min(Var_Q, 1.0)
-        # Rebalanced: upweight Var_Q (true uncertainty signal),
-        # downweight G (naturally high in Reversi once any structure forms).
-        # Old weights 0.4/0.4/0.2 produced λ≈0.85 in almost all midgame positions.
-        # New weights keep λ genuinely dynamic.
         lam = (
             0.3 * (1.0 - H_v) +
             0.3 * G +
             0.4 * (1.0 - var_term)
         )
         lam = float(np.clip(lam, 0.0, 1.0))
-        self.history.append(lam)
+        self.history_heuristic.append(lam)
+        return lam
+
+    def compute_lambda_budget(self, H_v: float, G: float, Var_Q: float) -> float:
+        """
+        Layer 7 weight. Gap-weighted: positional clarity (G) is the
+        strongest signal that the position is decided and budget can be cut.
+        """
+        var_term = min(Var_Q, 1.0)
+        lam = (
+            0.5 * G +
+            0.3 * (1.0 - H_v) +
+            0.2 * (1.0 - var_term)
+        )
+        lam = float(np.clip(lam, 0.0, 1.0))
+        self.history_budget.append(lam)
+        return lam
+
+    def compute_lambda_explore(self, H_v: float, G: float) -> float:
+        """
+        Layer 5 signal. High when entropy is high AND no move dominates yet —
+        i.e. genuinely uncertain, worth exploring more broadly.
+        """
+        lam = float(np.clip(H_v * (1.0 - G), 0.0, 1.0))
+        self.history_explore.append(lam)
         return lam
 
     def get_stats(self) -> Dict:
-        if not self.history:
-            return {'mean_lambda': 0.0, 'std_lambda': 0.0}
+        def _s(h: List[float]) -> Dict:
+            if not h:
+                return {'mean': 0.0, 'std': 0.0, 'min': 0.0, 'max': 0.0}
+            return {
+                'mean': float(np.mean(h)), 'std':  float(np.std(h)),
+                'min':  float(np.min(h)),  'max':  float(np.max(h)),
+            }
         return {
-            'mean_lambda': float(np.mean(self.history)),
-            'std_lambda':  float(np.std(self.history)),
-            'min_lambda':  float(np.min(self.history)),
-            'max_lambda':  float(np.max(self.history)),
+            'lambda_heuristic': _s(self.history_heuristic),
+            'lambda_budget':    _s(self.history_budget),
+            'lambda_explore':   _s(self.history_explore),
+            # Backward-compat scalar — used by training log
+            'mean_lambda': float(np.mean(self.history_heuristic)) if self.history_heuristic else 0.0,
+            'std_lambda':  float(np.std(self.history_heuristic))  if self.history_heuristic else 0.0,
         }
 
 
 # ── Layer 5: Dynamic exploration ──────────────────────────────────────────────
 
 class DynamicExploration:
-    """c_puct = c₀ · (1 + H_v)  — explore more when tree is uncertain."""
+    """
+    c_puct = c₀ · (1 + λ_explore)
+
+    λ_explore = H_v · (1 - G) is computed by LambdaController.
+    High when tree is uncertain (high H_v) and no move dominates (low G).
+    Accepting λ_explore directly keeps Layer 5 decoupled from the raw signals.
+    """
 
     def __init__(self, base_c: float = 1.414):
         self.base_c = base_c
 
-    def compute_c_puct(self, H_v: float, G: float = 0.0) -> float:
-        # Old: c = c₀·(1+H_v) — explored more whenever entropy was high,
-        # even when a dominant move was already forming.
-        # New: c = c₀·(1 + H_v·(1-G)) — only push exploration when
-        # entropy is high AND no move has pulled ahead yet.
-        return self.base_c * (1.0 + H_v * (1.0 - G))
+    def compute_c_puct(self, lam_explore: float) -> float:
+        # Equivalent to old c₀·(1 + H_v·(1-G)) — now receives the
+        # already-computed λ_explore rather than raw H_v / G.
+        return self.base_c * (1.0 + lam_explore)
 
 
 
@@ -193,15 +230,9 @@ class LambdaBudgetController:
         else:
             phase_mult = 0.8     # endgame — often decided
 
-        # Softened thresholds — old 0.7/1.3 at λ>0.7 caused double compression
-        # (high λ → trust heuristic + cut budget simultaneously).
-        # With λ commonly 0.75+, system was almost always at 70% budget.
-        if lam > 0.8:
-            lam_mult = 0.85
-        elif lam < 0.4:
-            lam_mult = 1.15
-        else:
-            lam_mult = 1.0
+        # Smooth sigmoid: ~1.15 at λ=0 (uncertain) → 1.0 at λ=0.5 → ~0.85 at λ=1 (clear)
+        # Replaces piecewise constant which had 15% budget jumps at λ=0.4 and λ=0.8.
+        lam_mult = 1.0 - 0.15 * (2.0 / (1.0 + np.exp(-5.0 * (lam - 0.5))) - 1.0)
 
         budget = int(self.base * phase_mult * lam_mult)
         budget = max(self.min_b, min(budget, self.max_b))
@@ -227,10 +258,12 @@ class TopologyLogger:
     Use later to train the λ MLP offline:
       input  → [H_v, G, Var_Q]
       target → λ_optimal derived from outcome column
+    All three λ channels are logged for Phase 5.5 analysis.
     """
 
     COLUMNS = ['move_num','player','H_v','G','Var_Q',
-               'lambda_h','c_puct','budget','tactical',
+               'lambda_h','lambda_budget','lambda_explore',
+               'c_puct','budget','tactical',
                'board_density','phase','win_outcome']
 
     def __init__(self, log_file: Optional[str] = None):
@@ -245,7 +278,8 @@ class TopologyLogger:
                 self.log_file = None
 
     def log(self, move_num: int, player: int, metrics: Dict,
-            lam: float, c_puct: float, budget: int,
+            lam_h: float, lam_b: float, lam_e: float,
+            c_puct: float, budget: int,
             tactical: bool, game: ReversiGame,
             win_outcome: Optional[int] = None):
 
@@ -255,18 +289,20 @@ class TopologyLogger:
                  'endgame' if total > 48 else 'midgame')
 
         row = {
-            'move_num':     move_num,
-            'player':       player,
-            'H_v':          round(metrics.get('visit_entropy',  0.0), 5),
-            'G':            round(metrics.get('dominance_gap',  0.0), 5),
-            'Var_Q':        round(metrics.get('value_variance', 0.0), 5),
-            'lambda_h':     round(lam,     5),
-            'c_puct':       round(c_puct,  5),
-            'budget':       budget,
-            'tactical':     int(tactical),
-            'board_density':round(density, 4),
-            'phase':        phase,
-            'win_outcome':  win_outcome if win_outcome is not None else '',
+            'move_num':      move_num,
+            'player':        player,
+            'H_v':           round(metrics.get('visit_entropy',  0.0), 5),
+            'G':             round(metrics.get('dominance_gap',  0.0), 5),
+            'Var_Q':         round(metrics.get('value_variance', 0.0), 5),
+            'lambda_h':      round(lam_h,   5),
+            'lambda_budget': round(lam_b,   5),
+            'lambda_explore':round(lam_e,   5),
+            'c_puct':        round(c_puct,  5),
+            'budget':        budget,
+            'tactical':      int(tactical),
+            'board_density': round(density, 4),
+            'phase':         phase,
+            'win_outcome':   win_outcome if win_outcome is not None else '',
         }
         self.data.append(row)
 
@@ -329,10 +365,19 @@ class TopologyAwareMCTS:
         self.use_pruning     = enable_soft_pruning
         self.use_early_stop  = enable_early_stop
         
-        #calibaration defaults (will be updated after first 50 sims )
-        self._h_v_thresh   = 0.20   # defaults before first calibration
-        self._g_thresh     = 0.50
-        self._var_q_thresh = 0.02
+        # Early-stop thresholds — Strength-First Rule.
+        # Only fire when the position is extremely clear on ALL three signals.
+        # These are conservative by design: it is much worse to stop a genuinely
+        # contested position early than to run a few extra sims on a decided one.
+        # set_thresholds() can override these, but the defaults are the primary authority.
+        self._h_v_thresh   = 0.15   # very low entropy  — visits nearly all on one move
+        self._g_thresh     = 0.85   # huge dominance gap — top move has massive visit lead
+        self._var_q_thresh = 0.01   # near-zero variance — children unanimously agree
+
+        # EMA smoothing state for λ — reset at the start of each search().
+        # Prevents λ from thrashing between refresh() calls within one move.
+        self._lam_h_smooth: float = 0.5
+        self._lam_e_smooth: float = 0.5
 
         # Aggregate stats
         self.tactical_moves    = 0
@@ -370,9 +415,10 @@ class TopologyAwareMCTS:
             policy = np.zeros(self.net.NUM_ACTIONS, dtype=np.float32)
             policy[self.net.move_to_action(mv)] = 1.0
             if self.logger:
-                self.logger.log(move_num, player, {}, 0.0, 0.0, 0, True, game)
+                self.logger.log(move_num, player, {}, 0.0, 0.0, 0.0, 0.0, 0, True, game)
             stats = {'simulations': 0, 'tactical': True,
-                     'lambda_h': 0.0, 'reason': reason}
+                     'lambda_h': 0.0, 'lambda_budget': 0.0, 'lambda_explore': 0.0,
+                     'reason': reason}
             if return_record:
                 rec = self._make_record(game, player, policy)
                 return mv, policy, stats, rec
@@ -393,34 +439,81 @@ class TopologyAwareMCTS:
         root = MCTSNode(game_state=game.copy())
         local_simulations = 0   # per-search counter — does NOT accumulate across moves
 
-        # ── Layer 7: Budget (probe on real root, sims count toward total) ─────
+        # ── Reset EMA smoothing state for this move ───────────────────────────
+        self._lam_h_smooth = 0.5
+        self._lam_e_smooth = 0.5
+
+        # ── Layer 7: Budget probe (runs on real root — sims not wasted) ───────
         if self.budget_ctrl:
-            PROBE = 50   # was 100 — 25% of budget was too much pre-shaping
+            PROBE = 50
             for _ in range(PROBE):
                 self._simulate(root, prior_probs, lam=0.0, c_puct=1.414)
                 local_simulations += 1
             probe_m = self.tree_metrics.compute(root)
-            probe_lam = self.lam_ctrl.compute_lambda(
+
+            # Budget uses its own λ channel (gap-weighted).
+            # probe_lam_b is intentionally a single point estimate — not EMA-smoothed —
+            # because budget is a one-shot decision made once per move at probe time.
+            # EMA only makes sense for lam_h/lam_e which are updated throughout the
+            # simulation loop via refresh(). Smoothing a one-shot value would just
+            # bleed in the previous move's context, which is wrong.
+            probe_lam_b = self.lam_ctrl.compute_lambda_budget(
                 probe_m['visit_entropy'],
                 probe_m['dominance_gap'],
                 probe_m['value_variance'],
             ) if self.lam_ctrl else 0.5
-            budget    = self.budget_ctrl.compute_budget(probe_lam, game)
+            budget    = self.budget_ctrl.compute_budget(probe_lam_b, game)
             remaining = max(0, budget - PROBE)
+
+            # Initialise smoothed lambdas from probe result
+            if self.lam_ctrl:
+                self._lam_h_smooth = self.lam_ctrl.compute_lambda_heuristic(
+                    probe_m['visit_entropy'], probe_m['dominance_gap'], probe_m['value_variance']
+                )
+                self._lam_e_smooth = self.lam_ctrl.compute_lambda_explore(
+                    probe_m['visit_entropy'], probe_m['dominance_gap']
+                )
+            metrics = probe_m
         else:
             budget    = 400
             remaining = budget
+            metrics   = self.tree_metrics.compute(root)
+            if self.lam_ctrl:
+                self._lam_h_smooth = self.lam_ctrl.compute_lambda_heuristic(
+                    metrics['visit_entropy'], metrics['dominance_gap'], metrics['value_variance']
+                )
+                self._lam_e_smooth = self.lam_ctrl.compute_lambda_explore(
+                    metrics['visit_entropy'], metrics['dominance_gap']
+                )
+                # No budget_ctrl means budget is fixed — use lam_h as a
+                # harmless proxy so probe_lam_b is always a valid point estimate.
+                probe_lam_b = self._lam_h_smooth
+            else:
+                # Both budget_ctrl and lam_ctrl disabled (e.g. ablation baseline).
+                # Use neutral 0.5 — only written to logs, never acted on.
+                probe_lam_b = 0.5
 
-        # ── Cache topology signals, refresh every METRICS_INTERVAL sims ───────
-        metrics  = self.tree_metrics.compute(root)
-        cur_lam  = self._lam(metrics)
-        cur_c    = self._c(metrics)
+        cur_lam_h = self._lam_h_smooth
+        cur_lam_e = self._lam_e_smooth
+        cur_c     = self._c_from_lam_e(cur_lam_e)
 
+        # ── Refresh closure — updates all signals with EMA ────────────────────
         def refresh():
-            nonlocal metrics, cur_lam, cur_c
+            nonlocal metrics, cur_lam_h, cur_lam_e, cur_c
             metrics = self.tree_metrics.compute(root)
-            cur_lam = self._lam(metrics)
-            cur_c   = self._c(metrics)
+            if self.lam_ctrl:
+                raw_h = self.lam_ctrl.compute_lambda_heuristic(
+                    metrics['visit_entropy'], metrics['dominance_gap'], metrics['value_variance']
+                )
+                raw_e = self.lam_ctrl.compute_lambda_explore(
+                    metrics['visit_entropy'], metrics['dominance_gap']
+                )
+                # EMA: 0.7 weight on previous smooth value prevents within-search thrashing
+                self._lam_h_smooth = 0.7 * self._lam_h_smooth + 0.3 * raw_h
+                self._lam_e_smooth = 0.7 * self._lam_e_smooth + 0.3 * raw_e
+            cur_lam_h = self._lam_h_smooth
+            cur_lam_e = self._lam_e_smooth
+            cur_c     = self._c_from_lam_e(cur_lam_e)
 
         # ── Main simulation loop ──────────────────────────────────────────────
         for i in range(remaining):
@@ -429,17 +522,17 @@ class TopologyAwareMCTS:
             # Layer 6: early stop — minimum 250 total sims before allowed
             if self.use_early_stop and local_simulations > 250 and self._should_stop(metrics):
                 break
-            self._simulate(root, prior_probs, cur_lam, cur_c)
+            self._simulate(root, prior_probs, cur_lam_h, cur_c)
             local_simulations      += 1
-            self.total_simulations += 1   # global stat only — not used for per-move reporting
+            self.total_simulations += 1
 
         refresh()  # final signals for logging/stats
-
 
         # ── Layer 8: Log ──────────────────────────────────────────────────────
         if self.logger:
             self.logger.log(move_num, player, metrics,
-                            cur_lam, cur_c, budget, False, game)
+                            cur_lam_h, probe_lam_b, cur_lam_e,
+                            cur_c, budget, False, game)
 
         # ── Policy target from visit counts ───────────────────────────────────
         visits = np.zeros(self.net.NUM_ACTIONS, dtype=np.float32)
@@ -458,10 +551,12 @@ class TopologyAwareMCTS:
         policy_target = visits / (visits.sum() + 1e-8)
 
         stats = {
-            'simulations':       local_simulations,   # per-move, not cumulative
-            'total_simulations': self.total_simulations,  # game-level aggregate
+            'simulations':       local_simulations,
+            'total_simulations': self.total_simulations,
             'tactical':          False,
-            'lambda_h':          cur_lam,
+            'lambda_h':          cur_lam_h,          # primary — backward compat
+            'lambda_budget':     probe_lam_b,
+            'lambda_explore':    cur_lam_e,
             'H_v':               metrics['visit_entropy'],
             'G':                 metrics['dominance_gap'],
             'Var_Q':             metrics['value_variance'],
@@ -474,7 +569,12 @@ class TopologyAwareMCTS:
         return chosen_move, policy_target, stats
     
     def set_thresholds(self, t: Dict):
-        """Inject calibrated thresholds from DynamicRecalibrator."""
+        """
+        Override early-stop thresholds. Called by training loop after
+        recalibration, or by benchmark to load from checkpoint.
+        The Strength-First defaults (0.15, 0.85, 0.01) are used if this
+        is never called — they are conservative enough to be safe standalone.
+        """
         self._h_v_thresh   = t['H_v_thresh']
         self._g_thresh     = t['G_thresh']
         self._var_q_thresh = t['Var_Q_thresh']
@@ -520,6 +620,8 @@ class TopologyAwareMCTS:
     def _select(self, node: MCTSNode, lambda_h: float, c_puct: float) -> MCTSNode:
         """
         Layer 2: PUCT + λ·h_astar.
+        λ is clamped to 0.6 max — prevents heuristic from fully dominating
+        the UCB score even when the controller is confident.
         All scoring runs inside the @njit kernel — no Python loop over children.
         """
         children = list(node.children.values())
@@ -536,10 +638,13 @@ class TopologyAwareMCTS:
             visit_counts[i] = child.visit_count
             h_astars[i]     = child.h_astar
 
+        # Clamp: never let heuristic fully dominate the selection signal
+        effective_lambda = min(lambda_h, 0.6)
+
         idx = _nb_ucb_select(
             q_values, priors, visit_counts,
             float(node.visit_count),
-            c_puct, h_astars, lambda_h,
+            c_puct, h_astars, effective_lambda,
             self.use_heuristic,
         )
         return children[idx]
@@ -566,37 +671,26 @@ class TopologyAwareMCTS:
         )
         child.h_astar = float(np.clip(h_raw, -1.0, 1.0))
 
-        # Layer 3: soft pruning via prior scaling
-        if self.use_pruning:
-            penalty = self._penalty(child.h_astar)
-            if penalty > 0:
-                child.prior *= np.exp(-0.5 * penalty)
+        # Layer 3: soft pruning — continuous penalty from h_astar
+        # Old: piecewise {0, 0.5, 1.0} → multipliers {1.0, 0.78, 0.61} (barely noticeable)
+        # New: continuous exp(-1.5 · max(0, -h)) → worst case h=-1 gives ×0.22
+        if self.use_pruning and child.h_astar < 0.0:
+            penalty = -child.h_astar   # in (0, 1] when h_astar < 0
+            child.prior *= np.exp(-1.5 * penalty)
 
         node.children[move] = child
         return child
-
-    def _penalty(self, h: float) -> float:
-        """Layer 3 penalty from already-computed h_astar."""
-        if h < -0.5: return 1.0
-        if h < 0.0:  return 0.5
-        return 0.0
 
     def _should_stop(self, m: Dict) -> bool:
         return (m['visit_entropy']  < self._h_v_thresh   and
                 m['dominance_gap']  > self._g_thresh      and
                 m['value_variance'] < self._var_q_thresh)
 
-    def _lam(self, m: Dict) -> float:
-        if self.lam_ctrl is None: return 0.0
-        return self.lam_ctrl.compute_lambda(
-            m['visit_entropy'], m['dominance_gap'], m['value_variance']
-        )
-
-    def _c(self, m: Dict) -> float:
-        if self.dyn_explore is None: return 1.414
-        return self.dyn_explore.compute_c_puct(
-            m['visit_entropy'], m['dominance_gap']
-        )
+    def _c_from_lam_e(self, lam_e: float) -> float:
+        """Compute c_puct from the explore λ channel."""
+        if self.dyn_explore is None:
+            return 1.414
+        return self.dyn_explore.compute_c_puct(lam_e)
 
     def _make_record(self, game: ReversiGame, player: int,
                      policy: np.ndarray) -> SelfPlayRecord:

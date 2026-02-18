@@ -44,13 +44,6 @@ from reversi_phase5_topology_core import (
 )
 from reversi_phase5_topology_layers import TopologyAwareMCTS
 from reversi_phase5_baseline import PureMCTS
-from reversi_phase5_dynamic_threshold_recalibrator import DynamicRecalibrator
-
-from reversi_phase5_topology_core import (
-    ReversiGame, TacticalSolver, PatternHeuristic, CompactReversiNet
-)
-from reversi_phase5_topology_layers import TopologyAwareMCTS
-from reversi_phase5_baseline import PureMCTS
 # ── Config ────────────────────────────────────────────────────────────────────
 
 def get_config() -> argparse.Namespace:
@@ -75,6 +68,8 @@ def get_config() -> argparse.Namespace:
                    help='Also run fixed-800 vs fixed-N to isolate compute effect')
     p.add_argument('--compute-control-budget', type=int, default=400,
                    help='Budget for baseline-vs-baseline compute control run')
+    p.add_argument('--seed',         type=int,  default=42,
+                   help='Global random seed for reproducibility')
     return p.parse_args()
 
 
@@ -588,7 +583,17 @@ def main():
     print(f"  Baseline budget:   {cfg.baseline_budget}")
     print(f"  Topology budget:   {cfg.topology_budget} (base, adapts)")
     print(f"  Ablation:          {cfg.ablation}")
+    print(f"  Seed:              {cfg.seed}")
     print(f"{'='*65}\n")
+
+    # ── Determinism ───────────────────────────────────────────────────────────
+    import random as _random
+    _random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    torch.cuda.manual_seed_all(cfg.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
 
     # Load network
     net = CompactReversiNet(8, 128)
@@ -602,24 +607,13 @@ def main():
         print(f"  Thresholds from checkpoint: {thresholds}")
     else:
         print("  ⚠ No checkpoint — using random network weights")
-        print("  (Results will reflect MCTS structure only, not learned play)\n")
+        print("  (Results will reflect MCTS structure only, not learned play)")
+        print(f"  Using hardcoded default thresholds: {thresholds}")
+
+    print(f"  NOTE: Benchmark uses fixed thresholds — no calibration run.")
+    print(f"        Recalibration belongs only inside training.\n")
 
     net.eval()
-
-    # Re-run calibration to get fresh thresholds for this network state
-    print("  Calibrating thresholds...")
-    recalibrator = DynamicRecalibrator(
-        network=net,
-        tactical_solver=TacticalSolver(),
-        pattern_heuristic=PatternHeuristic(),
-        probe_budget=150,
-        num_positions=200,
-        save_dir='benchmark_calibrations',
-    )
-    thresholds = recalibrator.initial_calibrate(verbose=False)
-    print(f"  Calibrated: H_v<{thresholds['H_v_thresh']:.3f}  "
-          f"G>{thresholds['G_thresh']:.3f}  "
-          f"Var_Q<{thresholds['Var_Q_thresh']:.4f}\n")
 
     full_config = dict(
         enable_heuristic=True,
@@ -657,6 +651,7 @@ def main():
     print(f"\n  Main matchup done in {time.time()-t0:.1f}s")
 
     # ── Ablation matrix ───────────────────────────────────────────────────────
+    ablation_results = []
     if cfg.ablation:
         print(f"\n{'─'*65}")
         print(f"  LAYER ABLATION MATRIX")
@@ -664,10 +659,36 @@ def main():
         print(f"  Each config tested for {cfg.games} games vs baseline\n")
 
         ablation_games = max(50, cfg.games // 2)   # faster for ablation
-        ablation_results = []
+        runner = run_matchup_parallel if cfg.parallel_games else run_matchup
 
-        for name, abl_cfg in get_ablation_configs():
-            print(f"\n  Testing: {name}")
+        for abl_name, abl_cfg in get_ablation_configs():
+            print(f"\n  Testing: {abl_name}")
+            abl_result = runner(
+                name=abl_name,
+                net=net,
+                thresholds=thresholds,
+                num_games=ablation_games,
+                temperature=cfg.temperature,
+                baseline_budget=cfg.baseline_budget,
+                topology_config=abl_cfg,
+                **({"num_workers": cfg.workers} if cfg.parallel_games else {}),
+            )
+            print_result(abl_result)
+            ablation_results.append(asdict(abl_result))
+            all_results.append(asdict(abl_result))
+
+        # Print ablation summary table
+        print(f"\n\n  {'─'*55}")
+        print(f"  ABLATION SUMMARY")
+        print(f"  {'─'*55}")
+        print(f"  {'Configuration':<38} {'WR':>6}  {'Savings':>8}  {'Sig':>5}")
+        print(f"  {'─'*55}")
+        for r_dict in ablation_results:
+            r = MatchupResult(**r_dict)
+            sig = "✓" if r.significant else " "
+            print(f"  {r.name:<38} {r.win_rate:>6.1%}  "
+                  f"{r.sim_savings_pct:>+7.1f}%  {sig:>5}")
+        print(f"  {'─'*55}")
 
     # Compute control: does ZenoZero beat naive budget reduction?
     if cfg.baseline_vs_baseline:
@@ -690,21 +711,6 @@ def main():
               f"Naive-reduction WR={ctrl_result.win_rate:.1%}  "
               f"→ topology adds {delta:+.1%}")
         print(f"  Done in {time.time()-t0:.1f}s")
-
-        all_results.extend(ablation_results)
-
-        # Print ablation summary table
-        print(f"\n\n  {'─'*55}")
-        print(f"  ABLATION SUMMARY")
-        print(f"  {'─'*55}")
-        print(f"  {'Configuration':<38} {'WR':>6}  {'Savings':>8}  {'Sig':>5}")
-        print(f"  {'─'*55}")
-        for r_dict in ablation_results:
-            r = MatchupResult(**r_dict)
-            sig = "✓" if r.significant else " "
-            print(f"  {r.name:<38} {r.win_rate:>6.1%}  "
-                  f"{r.sim_savings_pct:>+7.1f}%  {sig:>5}")
-        print(f"  {'─'*55}")
 
     # ── Save results ──────────────────────────────────────────────────────────
     output = {

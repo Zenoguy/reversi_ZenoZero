@@ -184,8 +184,6 @@ class PureMCTS:
         root.visit_count += 1   # same fix as topology system
 
 
-
-# Replace PureMCTS._select:
     def _select(self, node: MCTSNode) -> MCTSNode:
         """Standard PUCT — no heuristic. Uses @njit kernel."""
         children = list(node.children.values())

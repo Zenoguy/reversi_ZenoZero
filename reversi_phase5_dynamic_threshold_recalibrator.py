@@ -104,16 +104,17 @@ class CalibrationResult:
 
 class ThresholdCalibrator:
     """
-    Runs probe MCTS on a sample of self-play positions and derives
-    percentile-based thresholds for the topology early-stop condition.
+    Runs probe MCTS on a sample of self-play positions and collects
+    distribution statistics (mean, std, percentiles) for drift detection.
 
-    Percentile strategy:
-      H_v_thresh   = 25th percentile of H_v  (stop only when entropy is LOW)
-      G_thresh     = 75th percentile of G    (stop only when gap is HIGH)
-      Var_Q_thresh = 25th percentile of Var_Q (stop only when variance is LOW)
+    Strength-First Rule — thresholds are fixed conservative constants:
+      H_v_thresh   = 0.15  (stop only when entropy is very LOW)
+      G_thresh     = 0.85  (stop only when dominance gap is very HIGH)
+      Var_Q_thresh = 0.01  (stop only when value variance is near zero)
 
-    This means ~25% of positions would trigger early stop — enough to save
-    compute without cutting off genuinely contested positions.
+    All three must fire simultaneously. The actual stop rate is reported
+    for observability but is NOT a target — strength takes priority over
+    compute savings.
     """
 
     def __init__(
@@ -353,83 +354,42 @@ class ThresholdCalibrator:
     # ── Threshold computation ─────────────────────────────────────────────────
 
     @staticmethod
-    def _joint_stop_rate(
-        h: np.ndarray,
-        g: np.ndarray,
-        v: np.ndarray,
-        p: float,
-    ) -> float:
-        """
-        Given a single percentile parameter p ∈ [0, 100], compute thresholds as:
-          H_v_thresh   = percentile(h, p)       — stop if H_v   < this  (low entropy)
-          G_thresh     = percentile(g, 100-p)   — stop if G     > this  (high gap)
-          Var_Q_thresh = percentile(v, p)       — stop if Var_Q < this  (low variance)
-
-        As p increases all three conditions become easier to satisfy, so the
-        joint stop rate is monotonically non-decreasing in p.  This makes it
-        trivial to binary-search for a target rate.
-        """
-        h_t = float(np.percentile(h, p))
-        g_t = float(np.percentile(g, 100.0 - p))
-        v_t = float(np.percentile(v, p))
-        return float(((h < h_t) & (g > g_t) & (v < v_t)).mean())
-
-    @staticmethod
-    def _solve_percentile(
-        h: np.ndarray,
-        g: np.ndarray,
-        v: np.ndarray,
-        target_rate: float = 0.25,
-        tol: float = 0.005,
-        max_iter: int = 60,
-    ) -> float:
-        """
-        Binary-search for the percentile p that yields joint stop rate ≈ target_rate.
-        Returns the solved p value.
-        """
-        lo, hi = 0.0, 100.0
-
-        # Quick sanity: if even p=100 can't reach target (all metrics perfectly
-        # correlated but still < target), just return 100 and let caller warn.
-        if ThresholdCalibrator._joint_stop_rate(h, g, v, 100.0) < target_rate:
-            return 100.0
-
-        for _ in range(max_iter):
-            mid = (lo + hi) / 2.0
-            rate = ThresholdCalibrator._joint_stop_rate(h, g, v, mid)
-            if abs(rate - target_rate) < tol:
-                return mid
-            if rate < target_rate:
-                lo = mid
-            else:
-                hi = mid
-        return (lo + hi) / 2.0
-
-    @staticmethod
     def _compute_result(
         h_vs: List[float],
         gs:   List[float],
         var_qs: List[float],
         num_positions: int,
         training_iteration: int,
-        target_stop_rate: float = 0.25,
+        target_stop_rate: float = 0.25,   # kept for API compat, no longer used to set thresholds
     ) -> CalibrationResult:
-        h  = np.array(h_vs);  g = np.array(gs);  v = np.array(var_qs)
+        """
+        Strength-First Rule: thresholds are fixed conservative constants,
+        not derived from percentiles of the probed distribution.
 
-        # ── Numerically solve for the percentile p that achieves the target ──
-        # Instead of setting each threshold at its individual p25/p75 (which
-        # gives a joint AND-rate of only ~6-10% due to metric correlation), we
-        # binary-search a single shared percentile p so the *joint* condition
-        # fires at exactly target_stop_rate.
-        p_solved = ThresholdCalibrator._solve_percentile(
-            h, g, v, target_rate=target_stop_rate
-        )
+        The old percentile approach targeted a stop *rate* (25%) — meaning as
+        the model got stronger and all positions looked clearer, thresholds
+        tightened to maintain 25%, potentially stopping contested positions.
+        That optimises for frequency, not correctness.
 
-        H_v_thresh   = float(np.percentile(h, p_solved))
-        G_thresh     = float(np.percentile(g, 100.0 - p_solved))
-        Var_Q_thresh = float(np.percentile(v, p_solved))
+        Fixed thresholds ensure early stop only fires when the position is
+        genuinely unambiguous on ALL three signals simultaneously:
+          H_v < 0.15  — visits almost entirely on one move
+          G   > 0.85  — top move has massive advantage over second
+          Var_Q < 0.01 — children unanimously agree on value
 
-        # Verify the achieved rate (should be ≈ target_stop_rate)
+        Distribution stats are still computed for drift detection and logging.
+        The actual stop rate at these thresholds is reported for observability.
+        """
+        h = np.array(h_vs)
+        g = np.array(gs)
+        v = np.array(var_qs)
+
+        # Fixed conservative thresholds — the primary authority
+        H_v_thresh   = 0.15
+        G_thresh     = 0.85
+        Var_Q_thresh = 0.01
+
+        # Actual stop rate at these thresholds (observability only — not a target)
         stop_mask = (h < H_v_thresh) & (g > G_thresh) & (v < Var_Q_thresh)
         stop_rate = float(stop_mask.mean())
 
@@ -459,12 +419,13 @@ class ThresholdCalibrator:
     @staticmethod
     def _print_result(r: CalibrationResult, elapsed: float = 0.0):
         print(f"\n{'─'*65}")
-        print(f"  THRESHOLDS TO INJECT:  (joint binary-search, target=25%)")
-        print(f"    H_v   < {r.H_v_thresh:.4f}   (entropy — current median {r.H_v_p50:.4f})")
-        print(f"    G     > {r.G_thresh:.4f}   (gap     — current median {r.G_p50:.4f})")
-        print(f"    Var_Q < {r.Var_Q_thresh:.4f}   (variance — current median {r.Var_Q_p50:.4f})")
-        print(f"\n  ACHIEVED EARLY-STOP RATE: {r.expected_stop_rate*100:.1f}% of positions  (target 25%)")
-        print(f"\n  DISTRIBUTIONS:")
+        print(f"  THRESHOLDS (Strength-First — fixed conservative constants):")
+        print(f"    H_v   < {r.H_v_thresh:.4f}   (entropy — position median {r.H_v_p50:.4f})")
+        print(f"    G     > {r.G_thresh:.4f}   (gap     — position median {r.G_p50:.4f})")
+        print(f"    Var_Q < {r.Var_Q_thresh:.4f}   (variance — position median {r.Var_Q_p50:.4f})")
+        print(f"\n  ACTUAL EARLY-STOP RATE: {r.expected_stop_rate*100:.1f}%  "
+              f"(informational — not a target)")
+        print(f"\n  DISTRIBUTIONS (used for drift detection):")
         print(f"    H_v   {r.H_v_p25:.3f} / {r.H_v_p50:.3f} / {r.H_v_p75:.3f}  "
               f"(p25/p50/p75)  std={r.H_v_std:.3f}")
         print(f"    G     {r.G_p25:.3f} / {r.G_p50:.3f} / {r.G_p75:.3f}  "
@@ -635,7 +596,8 @@ class DynamicRecalibrator:
         def shifted(new_mean, old_mean, old_std) -> bool:
             if old_std < 1e-6:
                 return False
-            return abs(new_mean - old_mean) / (old_std + 1e-8) > self.drift_threshold * 10
+            # Trigger when the mean has shifted by more than drift_threshold std-devs
+            return abs(new_mean - old_mean) / (old_std + 1e-8) > self.drift_threshold
 
         return (shifted(np.mean(h_vs),   last.H_v_mean,   last.H_v_std)   or
                 shifted(np.mean(gs),     last.G_mean,     last.G_std)     or
@@ -671,15 +633,6 @@ class DynamicRecalibrator:
             print("\n  THRESHOLD DELTA: (no previous calibration — resume case)")
             return
 
-        print(f"\n  THRESHOLD DELTA (prev → current):")
-        print(f"    H_v_thresh   {prev.H_v_thresh:.4f} → {curr.H_v_thresh:.4f}  "
-            f"({'↑' if curr.H_v_thresh > prev.H_v_thresh else '↓'})")
-        print(f"    G_thresh     {prev.G_thresh:.4f} → {curr.G_thresh:.4f}  "
-            f"({'↑' if curr.G_thresh > prev.G_thresh else '↓'})")
-        print(f"    Var_Q_thresh {prev.Var_Q_thresh:.4f} → {curr.Var_Q_thresh:.4f}  "
-            f"({'↑' if curr.Var_Q_thresh > prev.Var_Q_thresh else '↓'})")
-        print(f"    Stop rate    {prev.expected_stop_rate*100:.1f}% → "
-            f"{curr.expected_stop_rate*100:.1f}%")
         print(f"\n  THRESHOLD DELTA (prev → current):")
         print(f"    H_v_thresh   {prev.H_v_thresh:.4f} → {curr.H_v_thresh:.4f}  "
               f"({'↑' if curr.H_v_thresh > prev.H_v_thresh else '↓'})")
