@@ -122,7 +122,6 @@ class LambdaController:
 
     def __init__(self):
         self.history_heuristic: List[float] = []
-        self.history_budget:    List[float] = []
         self.history_explore:   List[float] = []
 
     def compute_lambda_heuristic(self, H_v: float, G: float, Var_Q: float) -> float:
@@ -138,21 +137,6 @@ class LambdaController:
         )
         lam = float(np.clip(lam, 0.0, 1.0))
         self.history_heuristic.append(lam)
-        return lam
-
-    def compute_lambda_budget(self, H_v: float, G: float, Var_Q: float) -> float:
-        """
-        Layer 7 weight. Gap-weighted: positional clarity (G) is the
-        strongest signal that the position is decided and budget can be cut.
-        """
-        var_term = min(Var_Q, 1.0)
-        lam = (
-            0.5 * G +
-            0.3 * (1.0 - H_v) +
-            0.2 * (1.0 - var_term)
-        )
-        lam = float(np.clip(lam, 0.0, 1.0))
-        self.history_budget.append(lam)
         return lam
 
     def compute_lambda_explore(self, H_v: float, G: float) -> float:
@@ -174,7 +158,6 @@ class LambdaController:
             }
         return {
             'lambda_heuristic': _s(self.history_heuristic),
-            'lambda_budget':    _s(self.history_budget),
             'lambda_explore':   _s(self.history_explore),
             # Backward-compat scalar — used by training log
             'mean_lambda': float(np.mean(self.history_heuristic)) if self.history_heuristic else 0.0,
@@ -203,50 +186,113 @@ class DynamicExploration:
 
 
 
-# ── Layer 7: Budget control ───────────────────────────────────────────────────
+# ── Layer 7: Difficulty-proportional budget allocator ─────────────────────────
 
-class LambdaBudgetController:
+class DifficultyAllocator:
     """
-    Budget = base · phase_mult · lambda_mult
+    Phase 5.2: Difficulty-Proportional Budget Allocator.
 
-    High λ (clear structure) → reduce budget
-    Low  λ (uncertain)       → increase budget
-    Game phase adjustment: opening reduced, midgame boosted, endgame reduced.
+    Replaces the old λ-sigmoid approach which gave ±13% variation on a fixed
+    base (e.g. 348–452 on a 400 base). That's barely different from a constant
+    and is why compute savings mirrored the raw 400-vs-800 ratio.
+
+    New logic: after a probe phase of PROBE_SIMS simulations, compute a
+    difficulty score D ∈ [0,1] from tree topology:
+
+        D = 0.4 · H_v  +  0.4 · (1 − G)  +  0.2 · min(Var_Q, 1)
+
+    Intuition:
+      H_v high  → visits spread, position genuinely unclear → hard
+      G low     → no dominant move yet → hard
+      Var_Q high → children disagree on value → hard
+
+    Total budget is then:
+        budget = MIN_BUDGET + D · (MAX_BUDGET − MIN_BUDGET)
+
+    Default range [80, 900]:
+      D ≈ 0.0 → 80 sims   (forced / trivially clear)
+      D ≈ 0.5 → 490 sims  (typical midgame)
+      D ≈ 1.0 → 900 sims  (deeply contested)
+
+    Phase adjustment (applied after difficulty):
+      Opening   (< 16 pieces): × 0.7 — less strategic complexity
+      Midgame   (16–47 pieces): × 1.0 — full budget, highest complexity
+      Endgame   (≥ 48 pieces):  × 0.8 — often decided, save compute
+
+    Early stop remains a separate layer (Layer 6) — it acts as a safety valve
+    inside the allocated budget, not as the primary savings mechanism.
     """
 
-    def __init__(self, base: int = 400, min_b: int = 150, max_b: int = 800):
-        self.base  = base
-        self.min_b = min_b
-        self.max_b = max_b
-        self.history: List[int] = []
+    PROBE_SIMS = 100   # probe phase length — 50 was too few for reliable difficulty
 
-    def compute_budget(self, lam: float, game: ReversiGame) -> int:
+    def __init__(self, min_budget: int = 80, max_budget: int = 900):
+        self.min_budget = min_budget
+        self.max_budget = max_budget
+        self.history_budget:     List[int]   = []
+        self.history_difficulty: List[float] = []
+
+    def compute_difficulty(self, H_v: float, G: float, Var_Q: float) -> float:
+        """
+        Difficulty score D ∈ [0, 1].
+        High = contested position, needs more search.
+        Low  = clear position, safe to allocate fewer sims.
+
+        Multiplicative formula:
+            D = 0.7 · (H_v · (1−G))  +  0.3 · Var_Q
+
+        H_v and G are anti-correlated by construction — high entropy means visits
+        are spread, high gap means one move dominates. The linear sum
+        (0.4·H_v + 0.4·(1−G)) double-counts the same underlying signal and
+        mishandles noisy probes where both are spuriously high.
+
+        The product H_v·(1−G) is high only when entropy is genuine AND no move
+        has pulled ahead — the true "contested position" signal. This is the
+        same term used by λ_explore and has the same geometric intuition.
+
+        Var_Q stays separate — it comes from the value distribution,
+        not visit counts, so it carries independent information.
+        """
+        contested = H_v * (1.0 - G)          # ∈ [0, 1], zero if either signal is clear
+        var_term  = min(Var_Q, 1.0)
+        d = 0.7 * contested + 0.3 * var_term
+        return float(np.clip(d, 0.0, 1.0))
+
+    def compute_budget(self, H_v: float, G: float, Var_Q: float,
+                       game: ReversiGame) -> int:
+        """
+        Compute total sim budget for this move.
+        Call once after probe phase — budget includes the probe sims.
+        """
+        difficulty = self.compute_difficulty(H_v, G, Var_Q)
+        self.history_difficulty.append(difficulty)
+
         total_pieces = int(np.count_nonzero(game.board))
-
         if total_pieces < 16:
-            phase_mult = 0.7     # opening — less variance
+            phase_mult = 0.7   # opening
         elif total_pieces < 48:
-            phase_mult = 1.2     # midgame — most complex
+            phase_mult = 1.0   # midgame — full budget
         else:
-            phase_mult = 0.8     # endgame — often decided
+            phase_mult = 0.8   # endgame
 
-        # Smooth sigmoid: ~1.15 at λ=0 (uncertain) → 1.0 at λ=0.5 → ~0.85 at λ=1 (clear)
-        # Replaces piecewise constant which had 15% budget jumps at λ=0.4 and λ=0.8.
-        lam_mult = 1.0 - 0.15 * (2.0 / (1.0 + np.exp(-5.0 * (lam - 0.5))) - 1.0)
-
-        budget = int(self.base * phase_mult * lam_mult)
-        budget = max(self.min_b, min(budget, self.max_b))
-        self.history.append(budget)
+        # Sigmoid mapping: natural saturation at extremes, steeper in middle.
+        # k=8 gives gentle tails — easy positions pushed harder toward MIN,
+        # hard positions pushed harder toward MAX, vs linear which undershoots both.
+        sig = 1.0 / (1.0 + np.exp(-8.0 * (difficulty - 0.5)))
+        raw = self.min_budget + sig * (self.max_budget - self.min_budget)
+        budget = int(raw * phase_mult)
+        budget = max(self.min_budget, min(budget, self.max_budget))
+        self.history_budget.append(budget)
         return budget
 
     def get_stats(self) -> Dict:
-        if not self.history:
-            return {'mean_budget': 0, 'total_simulations': 0}
+        if not self.history_budget:
+            return {'mean_budget': 0, 'mean_difficulty': 0.0, 'total_simulations': 0}
         return {
-            'mean_budget':       float(np.mean(self.history)),
-            'min_budget':        int(np.min(self.history)),
-            'max_budget':        int(np.max(self.history)),
-            'total_simulations': int(np.sum(self.history)),
+            'mean_budget':       float(np.mean(self.history_budget)),
+            'min_budget':        int(np.min(self.history_budget)),
+            'max_budget':        int(np.max(self.history_budget)),
+            'mean_difficulty':   float(np.mean(self.history_difficulty)),
+            'total_simulations': int(np.sum(self.history_budget)),
         }
 
 
@@ -262,7 +308,7 @@ class TopologyLogger:
     """
 
     COLUMNS = ['move_num','player','H_v','G','Var_Q',
-               'lambda_h','lambda_budget','lambda_explore',
+               'lambda_h','difficulty','lambda_explore',
                'c_puct','budget','tactical',
                'board_density','phase','win_outcome']
 
@@ -278,7 +324,7 @@ class TopologyLogger:
                 self.log_file = None
 
     def log(self, move_num: int, player: int, metrics: Dict,
-            lam_h: float, lam_b: float, lam_e: float,
+            lam_h: float, difficulty: float, lam_e: float,
             c_puct: float, budget: int,
             tactical: bool, game: ReversiGame,
             win_outcome: Optional[int] = None):
@@ -294,13 +340,13 @@ class TopologyLogger:
             'H_v':           round(metrics.get('visit_entropy',  0.0), 5),
             'G':             round(metrics.get('dominance_gap',  0.0), 5),
             'Var_Q':         round(metrics.get('value_variance', 0.0), 5),
-            'lambda_h':      round(lam_h,   5),
-            'lambda_budget': round(lam_b,   5),
-            'lambda_explore':round(lam_e,   5),
-            'c_puct':        round(c_puct,  5),
+            'lambda_h':      round(lam_h,      5),
+            'difficulty':    round(difficulty,  5),
+            'lambda_explore':round(lam_e,      5),
+            'c_puct':        round(c_puct,     5),
             'budget':        budget,
             'tactical':      int(tactical),
-            'board_density': round(density, 4),
+            'board_density': round(density,    4),
             'phase':         phase,
             'win_outcome':   win_outcome if win_outcome is not None else '',
         }
@@ -345,6 +391,9 @@ class TopologyAwareMCTS:
         enable_lambda_budget:      bool = True,
         enable_logging:            bool = False,
         log_file:          Optional[str] = None,
+        # Budget allocator range — exposed so benchmark/training can control them
+        min_budget:        int = 80,
+        max_budget:        int = 900,
     ):
         self.net      = network
         self.solver   = tactical_solver
@@ -357,7 +406,7 @@ class TopologyAwareMCTS:
         self.tree_metrics  = TreeMetrics()
         self.lam_ctrl      = LambdaController()    if enable_dynamic_lambda      else None
         self.dyn_explore   = DynamicExploration()  if enable_dynamic_exploration else None
-        self.budget_ctrl   = LambdaBudgetController() if enable_lambda_budget    else None
+        self.budget_ctrl   = DifficultyAllocator(min_budget, max_budget) if enable_lambda_budget else None
         self.logger        = TopologyLogger(log_file) if enable_logging          else None
 
         # Flags
@@ -417,7 +466,7 @@ class TopologyAwareMCTS:
             if self.logger:
                 self.logger.log(move_num, player, {}, 0.0, 0.0, 0.0, 0.0, 0, True, game)
             stats = {'simulations': 0, 'tactical': True,
-                     'lambda_h': 0.0, 'lambda_budget': 0.0, 'lambda_explore': 0.0,
+                     'lambda_h': 0.0, 'lambda_explore': 0.0, 'difficulty': 0.0,
                      'reason': reason}
             if return_record:
                 rec = self._make_record(game, player, policy)
@@ -443,26 +492,33 @@ class TopologyAwareMCTS:
         self._lam_h_smooth = 0.5
         self._lam_e_smooth = 0.5
 
-        # ── Layer 7: Budget probe (runs on real root — sims not wasted) ───────
+        # ── Layer 7: Difficulty probe (runs on real root — sims not wasted) ────
+        # PROBE = 100 sims: more reliable difficulty estimate than the old 50.
+        # Budget is allocated once here and never changed mid-search.
+        # Early stop (Layer 6) can exit before budget is exhausted, but cannot
+        # increase it. DifficultyAllocator is the primary savings mechanism.
+        PROBE = DifficultyAllocator.PROBE_SIMS if self.budget_ctrl else 0
+        probe_difficulty = 0.5   # neutral fallback for logging
+
         if self.budget_ctrl:
-            PROBE = 50
             for _ in range(PROBE):
                 self._simulate(root, prior_probs, lam=0.0, c_puct=1.414)
                 local_simulations += 1
             probe_m = self.tree_metrics.compute(root)
 
-            # Budget uses its own λ channel (gap-weighted).
-            # probe_lam_b is intentionally a single point estimate — not EMA-smoothed —
-            # because budget is a one-shot decision made once per move at probe time.
-            # EMA only makes sense for lam_h/lam_e which are updated throughout the
-            # simulation loop via refresh(). Smoothing a one-shot value would just
-            # bleed in the previous move's context, which is wrong.
-            probe_lam_b = self.lam_ctrl.compute_lambda_budget(
+            # Difficulty is computed directly from topology — not λ-mediated.
+            # This is a one-shot decision; see DifficultyAllocator for rationale.
+            probe_difficulty = self.budget_ctrl.compute_difficulty(
                 probe_m['visit_entropy'],
                 probe_m['dominance_gap'],
                 probe_m['value_variance'],
-            ) if self.lam_ctrl else 0.5
-            budget    = self.budget_ctrl.compute_budget(probe_lam_b, game)
+            )
+            budget    = self.budget_ctrl.compute_budget(
+                probe_m['visit_entropy'],
+                probe_m['dominance_gap'],
+                probe_m['value_variance'],
+                game,
+            )
             remaining = max(0, budget - PROBE)
 
             # Initialise smoothed lambdas from probe result
@@ -485,13 +541,7 @@ class TopologyAwareMCTS:
                 self._lam_e_smooth = self.lam_ctrl.compute_lambda_explore(
                     metrics['visit_entropy'], metrics['dominance_gap']
                 )
-                # No budget_ctrl means budget is fixed — use lam_h as a
-                # harmless proxy so probe_lam_b is always a valid point estimate.
-                probe_lam_b = self._lam_h_smooth
-            else:
-                # Both budget_ctrl and lam_ctrl disabled (e.g. ablation baseline).
-                # Use neutral 0.5 — only written to logs, never acted on.
-                probe_lam_b = 0.5
+            # probe_difficulty stays 0.5 if budget_ctrl is disabled
 
         cur_lam_h = self._lam_h_smooth
         cur_lam_e = self._lam_e_smooth
@@ -531,7 +581,7 @@ class TopologyAwareMCTS:
         # ── Layer 8: Log ──────────────────────────────────────────────────────
         if self.logger:
             self.logger.log(move_num, player, metrics,
-                            cur_lam_h, probe_lam_b, cur_lam_e,
+                            cur_lam_h, probe_difficulty, cur_lam_e,
                             cur_c, budget, False, game)
 
         # ── Policy target from visit counts ───────────────────────────────────
@@ -554,9 +604,9 @@ class TopologyAwareMCTS:
             'simulations':       local_simulations,
             'total_simulations': self.total_simulations,
             'tactical':          False,
-            'lambda_h':          cur_lam_h,          # primary — backward compat
-            'lambda_budget':     probe_lam_b,
+            'lambda_h':          cur_lam_h,        # primary — backward compat
             'lambda_explore':    cur_lam_e,
+            'difficulty':        probe_difficulty,  # replaces lambda_budget
             'H_v':               metrics['visit_entropy'],
             'G':                 metrics['dominance_gap'],
             'Var_Q':             metrics['value_variance'],

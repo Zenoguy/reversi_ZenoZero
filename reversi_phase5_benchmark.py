@@ -44,7 +44,22 @@ from reversi_phase5_topology_core import (
 )
 from reversi_phase5_topology_layers import TopologyAwareMCTS
 from reversi_phase5_baseline import PureMCTS
-# ── Config ────────────────────────────────────────────────────────────────────
+
+# ── Progress reporting ────────────────────────────────────────────────────────
+
+def _progress(label: str, done: int, total: int, results: list, t0: float):
+    """Print a one-line progress update. Called every PRINT_EVERY games."""
+    wins  = sum(r.topology_win  for r in results)
+    draws = sum(r.topology_draw for r in results)
+    losses = done - wins - draws
+    wr     = wins / done if done else 0.0
+    elapsed = time.time() - t0
+    pct    = done / total * 100
+    print(f"  [{label}]  {done:>4}/{total}  ({pct:>5.1f}%)  "
+          f"W={wins} D={draws} L={losses}  WR={wr:.1%}  "
+          f"[{elapsed:.0f}s]", flush=True)
+
+PRINT_EVERY = 10   # print a line every N completed games
 
 def get_config() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -59,8 +74,10 @@ def get_config() -> argparse.Namespace:
     p.add_argument('--temperature', type=float, default=0.0,
                    help='MCTS temperature for move selection (0=greedy)')
     p.add_argument('--baseline-budget', type=int, default=800)
-    p.add_argument('--topology-budget', type=int, default=400,
-                   help='Base budget for topology MCTS (adapts dynamically)')
+    p.add_argument('--min-budget',  type=int,  default=80,
+                   help='DifficultyAllocator min sims — easy/forced positions')
+    p.add_argument('--max-budget',  type=int,  default=900,
+                   help='DifficultyAllocator max sims — deeply contested positions')
     p.add_argument('--output',      type=str,  default='benchmark_results.json')
     p.add_argument('--parallel-games',  action='store_true',
                    help='Run benchmark games in parallel (cpu_count//2-1 workers)')
@@ -224,18 +241,15 @@ def run_matchup(
     baseline_mcts.__class__.BUDGET = baseline_budget
 
     results: List[GameResult] = []
+    t0 = time.time()
+    label = name[:38]
 
     for i in range(num_games):
-        # Alternate colours every game
         topology_is_black = (i % 2 == 0)
         r = play_game(topology_mcts, baseline_mcts, topology_is_black, temperature)
         results.append(r)
-
-        if (i + 1) % 10 == 0:
-            wins  = sum(r.topology_win  for r in results)
-            draws = sum(r.topology_draw for r in results)
-            wr    = wins / len(results)
-            print(f"    [{name}]  {i+1}/{num_games}  W={wins} D={draws} L={len(results)-wins-draws}  WR={wr:.2%}")
+        if (i + 1) % PRINT_EVERY == 0 or (i + 1) == num_games:
+            _progress(label, i + 1, num_games, results, t0)
 
     # Aggregate
     wins   = sum(r.topology_win  for r in results)
@@ -277,7 +291,7 @@ def run_matchup(
 
 # ── Ablation configurations ───────────────────────────────────────────────────
 
-def get_ablation_configs() -> List[Tuple[str, dict]]:
+def get_ablation_configs(min_budget: int = 80, max_budget: int = 900) -> List[Tuple[str, dict]]:
     """
     Ordered ablation: start from pure baseline, add layers one by one.
     Each config dict maps directly to TopologyAwareMCTS keyword args.
@@ -301,10 +315,12 @@ def get_ablation_configs() -> List[Tuple[str, dict]]:
             enable_early_stop=True,
             enable_lambda_budget=True,
             enable_logging=False,
+            min_budget=min_budget,
+            max_budget=max_budget,
         )),
         ("+L2 only (fixed heuristic, λ=0.05)", dict(
             **base,
-            enable_heuristic=True,      # λ=0 in controller, but we hack below
+            enable_heuristic=True,
         )),
         ("+L2+L4 (heuristic + dynamic λ)", dict(
             **base,
@@ -332,6 +348,8 @@ def get_ablation_configs() -> List[Tuple[str, dict]]:
             enable_early_stop=True,
             enable_lambda_budget=True,
             enable_logging=False,
+            min_budget=min_budget,
+            max_budget=max_budget,
         )),
     ]
     return configs
@@ -443,8 +461,12 @@ def run_matchup_parallel(
         procs.append(p)
 
     all_results = []
+    t0 = time.time()
+    label = name[:38]
     for _ in range(num_workers):
-        all_results.extend(result_q.get(timeout=7200))
+        batch = result_q.get(timeout=7200)
+        all_results.extend(batch)
+        _progress(label, len(all_results), num_games, all_results, t0)
     for p in procs:
         p.join(timeout=30)
 
@@ -480,23 +502,17 @@ def run_matchup_parallel(
     )
 
 
-def run_baseline_vs_baseline(
-    net:           CompactReversiNet,
-    num_games:     int,
-    temperature:   float,
-    budget_a:      int,   # "strong" baseline
-    budget_b:      int,   # "weak" baseline (compute-matched to ZenoZero)
-) -> MatchupResult:
-    """
-    Pits Baseline-A (budget_a sims) against Baseline-B (budget_b sims).
-    Reported from Baseline-B's perspective so you can compare directly
-    with ZenoZero's win rate against Baseline-A.
-
-    This answers: is ZenoZero better than just running fewer sims?
-    If ZenoZero beats Baseline-A at 52% but Baseline-B only beats
-    Baseline-A at 43%, ZenoZero's topology is adding real value.
-    """
+def baseline_worker_fn(num_games, start_idx, result_q,
+                       state_dict, budget_a, budget_b, temperature):
+    """Worker for baseline-vs-baseline parallel games."""
+    from reversi_phase5_topology_core import (
+        ReversiGame, TacticalSolver, CompactReversiNet
+    )
     from reversi_phase5_baseline import PureMCTS
+
+    net = CompactReversiNet(8, 128)
+    net.load_state_dict(state_dict)
+    net.eval()
 
     class BaselineA(PureMCTS):
         BUDGET = budget_a
@@ -508,9 +524,8 @@ def run_baseline_vs_baseline(
 
     results = []
     for i in range(num_games):
-        b_is_black = (i % 2 == 0)
-        # Reuse play_game — treat B as "topology" and A as "baseline"
-        game = ReversiGame()
+        b_is_black = ((start_idx + i) % 2 == 0)
+        game    = ReversiGame()
         b_player = 1 if b_is_black else -1
         b_sims = 0; a_sims = 0
         b_tactic = 0; a_tactic = 0
@@ -544,6 +559,115 @@ def run_baseline_vs_baseline(
             avg_kl_divergence=0.0,
         ))
 
+    result_q.put(results)
+
+
+def run_baseline_vs_baseline(
+    net:           CompactReversiNet,
+    num_games:     int,
+    temperature:   float,
+    budget_a:      int,   # "strong" baseline
+    budget_b:      int,   # "weak" baseline (compute-matched to ZenoZero)
+    num_workers:   int = 1,
+) -> MatchupResult:
+    """
+    Pits Baseline-A (budget_a sims) against Baseline-B (budget_b sims).
+    Reported from Baseline-B's perspective so you can compare directly
+    with ZenoZero's win rate against Baseline-A.
+
+    Runs in parallel when num_workers > 1 (same pattern as run_matchup_parallel).
+    """
+    name = f"Baseline-{budget_b} vs Baseline-{budget_a} (compute control)"
+
+    if num_workers > 1:
+        # ── Parallel path ─────────────────────────────────────────────────────
+        games_per_worker = [num_games // num_workers] * num_workers
+        for i in range(num_games % num_workers):
+            games_per_worker[i] += 1
+        offsets = [sum(games_per_worker[:i]) for i in range(num_workers)]
+
+        ctx = mp.get_context('fork')
+        result_q = ctx.Queue()
+        procs = []
+        for wid in range(num_workers):
+            p = ctx.Process(
+                target=baseline_worker_fn,
+                args=(
+                    games_per_worker[wid],
+                    offsets[wid],
+                    result_q,
+                    net.state_dict(),
+                    budget_a,
+                    budget_b,
+                    temperature,
+                ),
+            )
+            p.start()
+            procs.append(p)
+
+        results = []
+        t0 = time.time()
+        label = name[:38]
+        for _ in range(num_workers):
+            batch = result_q.get(timeout=7200)
+            results.extend(batch)
+            _progress(label, len(results), num_games, results, t0)
+        for p in procs:
+            p.join(timeout=30)
+
+    else:
+        # ── Sequential path ────────────────────────────────────────────────────
+        from reversi_phase5_baseline import PureMCTS
+
+        class BaselineA(PureMCTS):
+            BUDGET = budget_a
+        class BaselineB(PureMCTS):
+            BUDGET = budget_b
+
+        mcts_a = BaselineA(net, TacticalSolver())
+        mcts_b = BaselineB(net, TacticalSolver())
+
+        results = []
+        t0 = time.time()
+        label = name[:38]
+        for i in range(num_games):
+            b_is_black = (i % 2 == 0)
+            game     = ReversiGame()
+            b_player = 1 if b_is_black else -1
+            b_sims = 0; a_sims = 0
+            b_tactic = 0; a_tactic = 0
+            move_num = 0
+            while not game.game_over:
+                legal = game.get_legal_moves()
+                if not legal:
+                    game.make_move(None); move_num += 1; continue
+                if game.current_player == b_player:
+                    move, _, stats = mcts_b.search(game, temperature=temperature)
+                    b_sims   += stats.get('simulations', 0)
+                    b_tactic += int(stats.get('tactical', False))
+                else:
+                    move, _, stats = mcts_a.search(game, temperature=temperature)
+                    a_sims   += stats.get('simulations', 0)
+                    a_tactic += int(stats.get('tactical', False))
+                game.make_move(move); move_num += 1
+
+            results.append(GameResult(
+                winner=game.winner,
+                topology_player=b_player,
+                topology_win=(game.winner == b_player),
+                topology_draw=(game.winner == 0),
+                game_length=move_num,
+                topology_sims=b_sims,
+                baseline_sims=a_sims,
+                topology_tactical=b_tactic,
+                baseline_tactical=a_tactic,
+                topology_avg_lambda=0.0,
+                topology_avg_H_v=0.0,
+                avg_kl_divergence=0.0,
+            ))
+            if (i + 1) % PRINT_EVERY == 0 or (i + 1) == num_games:
+                _progress(label, i + 1, num_games, results, t0)
+
     wins   = sum(r.topology_win  for r in results)
     draws  = sum(r.topology_draw for r in results)
     losses = num_games - wins - draws
@@ -553,7 +677,7 @@ def run_baseline_vs_baseline(
     binom = scipy_stats.binomtest(wins, num_games, p=0.5, alternative='two-sided')
 
     return MatchupResult(
-        name=f"Baseline-{budget_b} vs Baseline-{budget_a} (compute control)",
+        name=name,
         games=num_games, wins=wins, draws=draws, losses=losses,
         win_rate=wins/num_games, draw_rate=draws/num_games, loss_rate=losses/num_games,
         avg_sims_topology=float(avg_b),
@@ -581,7 +705,7 @@ def main():
     print(f"  Games per matchup: {cfg.games}")
     print(f"  Temperature:       {cfg.temperature}")
     print(f"  Baseline budget:   {cfg.baseline_budget}")
-    print(f"  Topology budget:   {cfg.topology_budget} (base, adapts)")
+    print(f"  Topology budget:   [{cfg.min_budget}, {cfg.max_budget}] (difficulty-proportional)")
     print(f"  Ablation:          {cfg.ablation}")
     print(f"  Seed:              {cfg.seed}")
     print(f"{'='*65}\n")
@@ -623,6 +747,8 @@ def main():
         enable_early_stop=True,
         enable_lambda_budget=True,
         enable_logging=False,
+        min_budget=cfg.min_budget,
+        max_budget=cfg.max_budget,
     )
 
     all_results = []
@@ -661,7 +787,7 @@ def main():
         ablation_games = max(50, cfg.games // 2)   # faster for ablation
         runner = run_matchup_parallel if cfg.parallel_games else run_matchup
 
-        for abl_name, abl_cfg in get_ablation_configs():
+        for abl_name, abl_cfg in get_ablation_configs(cfg.min_budget, cfg.max_budget):
             print(f"\n  Testing: {abl_name}")
             abl_result = runner(
                 name=abl_name,
@@ -702,6 +828,7 @@ def main():
             temperature=cfg.temperature,
             budget_a=cfg.baseline_budget,
             budget_b=cfg.compute_control_budget,
+            num_workers=cfg.workers if cfg.parallel_games else 1,
         )
         print_result(ctrl_result)
         all_results.append(asdict(ctrl_result))
