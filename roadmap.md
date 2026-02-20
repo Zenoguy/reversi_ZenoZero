@@ -1,491 +1,473 @@
-Honest assessment, no sugar-coating.
+# Phase 5.5 Through 10: Conceptual Roadmap
 
 ---
 
-## What's Genuinely Good
+## Phase 5.5 — Learning Instead of Engineering
 
-**1. The core observables (H_v, G, Var_Q) are excellent choices.**
+### **The Core Problem**
 
-They're informationally rich and dirt cheap — 3 scalars from visit counts and Q-values. No expensive lookahead, no Bayesian inference, just arithmetic on data you already have. This is the strongest part of the architecture.
+Right now, our λ formula uses three fixed weights: 30% for tree concentration (1-H_v), 30% for dominance (G), and 40% for value stability (1-Var_Q). These numbers came from manual experimentation on Reversi. But think about what this means:
 
-**2. Probe-then-search is clever.**
+**The metareasoning policy is a hand-crafted heuristic.** we've built a system that decides when to trust heuristics... using a heuristic. That's philosophically awkward and practically limiting.
 
-50 sims to estimate λ, then reuse that tree for the main search. You're not throwing away the probe (like the original design would have). This two-stage pattern is a mini stochastic program and it works.
+When we move to Chess, those weights will be wrong. Chess has deeper tactics, longer horizons, more complex positions. The balance between "tree looks concentrated" and "values are stable" will be different. we'll have to retune. Same for Go, same for StarCraft, same for robotics.
 
-**3. Layered design with ablation toggles is publication-grade methodology.**
+### **The Conceptual Shift**
 
-Being able to turn each layer on/off independently means your ablation experiments will be clean. Most papers don't do this — they compare "full system vs baseline" and can't tell you which components matter.
+Instead of engineering the metareasoning policy, **learn it from experience**. The system should discover, through trial and error, what topology patterns predict when heuristics are trustworthy.
 
-**4. Dynamic calibration is the right move.**
+Think of it like this: Right now we're telling the system "when entropy drops below X and dominance exceeds Y, trust our heuristic." That's prescriptive. The learned version says "show me 100,000 examples of positions, what we decided, and whether it worked out. I'll figure out the pattern myself."
 
-Thresholds shift as the network trains. Most systems would use fixed thresholds and break as the model improves. You avoided that.
+### **What Gets Learned**
 
-**5. The 83% vs 53% result speaks for itself.**
+we're learning a function that maps:
+- **Input:** Current tree state (H_v, G, Var_Q) + position features (board density, game phase, mobility)
+- **Output:** Three control signals — how much to trust heuristic, how much budget to allocate, how much to explore
 
-Topology-based metareasoning beats naive budget reduction by 30pp. That's not a fluke — the system is extracting real signal from tree geometry.
+The beauty is the system can discover nonlinear relationships we'd never hand-engineer. Maybe in endgames, Var_Q doesn't matter at all but H_v is critical. Maybe in tactical positions, G is the only signal that matters. The learned controller finds these patterns automatically.
 
----
+### **The Training Signal Problem**
 
-## What's Problematic
+Here's the tricky part: **How do we know what the "correct" λ should have been for a past position?**
 
-**0. Freeze the Universe (Determinism First)**
+we don't have ground truth. we can't look up the optimal metareasoning policy in a table. So we need to derive it retroactively using one of three approaches:
 
-Do this **before touching logic**.
+**Approach 1: Outcome-based learning**
+After a game finishes, propagate the outcome backward. Positions in a winning game probably had good λ values. Positions in losing games probably didn't. This is noisy but simple — we're using game results as a proxy for metareasoning quality.
 
-### 1️⃣ Global seeding (everywhere)
+**Approach 2: Efficiency-based learning**
+For each position, measure both search cost (simulations used) and decision quality (how good was the chosen move vs the true best). The optimal λ minimizes both. we want to spend few simulations AND pick good moves. This creates a multi-objective optimization problem: balance compute efficiency against decision quality.
 
-Add once at program start:
+**Approach 3: Counterfactual evaluation**
+The most expensive but most accurate: After a game, go back to critical positions and replay them with different λ values. See which λ would have led to the best outcome. This is like hindsight — we're asking "knowing how the game turned out, what metareasoning policy would have been optimal?" Then we train toward that policy.
 
-```python
-import random
-import numpy as np
-import torch
+### **Why This Changes Everything**
 
-SEED = 42
+With a learned controller, we can now:
+- **Adapt during training** — early in training when the neural network is weak, maybe trust heuristics more. Later when the network is strong, trust it more. The controller learns this balance.
+- **Transfer across positions** — the learned controller discovers which features of a position predict good metareasoning, not just which tree states.
+- **Handle new situations** — if the learned controller sees a position type it's never encountered, it can interpolate from similar positions. The formula-based controller just uses the same weights blindly.
 
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
+### **Success Criteria**
 
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-```
-
-Also:
-
-* Disable Dirichlet noise in benchmarking
-* Use `temperature=0` always in evaluation
-* Fix multiprocessing start method:
-
-```python
-mp.set_start_method("spawn", force=True)
-```
-
-
-**1. λ controls too many things at once.**
-
-Right now a single scalar λ modulates:
-- Heuristic injection weight (Layer 2)
-- Budget allocation (Layer 7)
-- Indirectly affects early stop (via thresholds)
-
-This creates **control coupling** that makes it impossible to disentangle what's actually helping. Is the 30pp win from better heuristic use? From smarter budget allocation? From the combination? You can't tell.
-
-**Fix:** Separate control channels.
-```python
-λ_heuristic = 0.3*(1-H_v) + 0.3*G + 0.4*(1-Var_Q)  # Layer 2
-λ_budget    = 0.5*G + 0.3*(1-H_v) + 0.2*phase_mult # Layer 7
-λ_explore   = H_v * (1 - G)                         # Layer 5
-```
-
-Different functions, different weights. Now you can ablate each independently.
+The learned controller succeeds if:
+1. It matches or beats the deterministic formula on Reversi positions it was trained on
+2. It generalizes to held-out Reversi positions (different game states)
+3. When we move to a new game (Chess), it requires less retraining than starting from scratch with a new formula
 
 ---
 
-**2. The probe is expensive for what it gives you.**
+## Phase 6 — Opponent Modeling: Metareasoning Becomes Game Theory
 
-You spend 50 sims (12.5% of a 400-sim budget) just to estimate λ, which then adjusts budget by ±15-30%. That's a lot of meta-computation for modest benefit.
+### **The Conceptual Gap**
 
-**Better approach:** Amortize it. Train a tiny MLP to predict λ from position features:
-```python
-λ = MLP([prior_entropy, board_density, phase])  # O(1) cost
-```
+our current system treats the game as if it's solitaire. we're deciding "how much compute should I spend to find a good move?" But we're ignoring a crucial fact: **our opponent is also searching, and their search strategy affects what we should do.**
 
-Offline, collect (position, tree_topology, optimal_λ) triples from self-play logs. Train the MLP. Now λ prediction is ~100 flops instead of 50 simulations.
+Think about playing against two different opponents:
+- **Opponent A:** Novice player, only searches 100 simulations, makes tactical errors
+- **Opponent B:** Expert player, searches 10,000 simulations, nearly optimal play
 
----
+Against Opponent A, we can afford to trust our heuristic more. Why? Because even if our heuristic makes small errors, their blunders will overwhelm our mistakes. we can "get away with" cheaper metareasoning.
 
-**3. The λ formula has no theoretical justification.**
+Against Opponent B, we need to search deeply. They won't give we free wins. Every small evaluation error matters because they'll exploit it.
 
-Weights (0.3, 0.3, 0.4) came from empirical tuning on Reversi. Will they transfer to Chess? Go? Probably not without retuning.
+**our current system doesn't distinguish between these cases.** It computes λ based only on tree topology, not on who it's playing.
 
-**What's missing:** Connection to regret or value of information. Ideally:
-```
-λ = argmax_λ  E[utility | tree_state, budget] - cost(λ)
-```
+### **The Game-Theoretic Insight**
 
-Even a sketch derivation (e.g., "if H_v is low, expected regret from trusting heuristic is O(ε²)") would make this much stronger.
+Optimal metareasoning in a two-player game is a **nested optimization problem**:
+- we're trying to maximize our win probability
+- But win probability depends on opponent's strategy
+- our opponent is also doing metareasoning, trying to maximize their win probability
+- Their metareasoning affects which positions arise, which affects our optimal λ
 
----
+This creates a **meta-game** above the object-level game. we're not just playing Reversi against them — we're playing a resource allocation game where we both decide how much compute to invest.
 
-**4. Early stop is too conservative.**
+### **What Opponent Modeling Adds**
 
-Replace with Strength-First Rule
+Track patterns in how our opponent plays:
+- **Move selection:** Do they play the most popular moves (suggesting deep search) or make surprising choices (suggesting shallow search or different evaluation)?
+- **Time usage:** Are they spending lots of time on simple positions (suggesting they're weak) or making fast, accurate moves (suggesting they're strong)?
+- **Style patterns:** Do they play aggressively (lots of captures) or positionally (slow maneuvering)?
 
-Instead of:
+From these observations, build a model of opponent strength and style. Then adjust our λ:
+- Against weak opponents: increase λ_heuristic (trust our evaluation more, they won't punish small errors)
+- Against strong opponents: decrease λ_heuristic (search deeply, can't afford mistakes)
+- Against time-pressured opponents: increase our own search budget (they'll make hasty moves we can exploit)
 
-H_v_thresh = percentile(...)
-G_thresh   = percentile(...)
-Var_Q_thresh = percentile(...)
+### **The Adaptation Loop**
 
-Use fixed conservative thresholds:
+As the game progresses, we get more data about our opponent. Early moves might suggest they're strong, but then they make a blunder — update our model, increase λ, save compute. This is **online learning during the game.**
 
-self._h_v_thresh   = 0.15   # very low entropy
-self._g_thresh     = 0.85   # huge dominance
-self._var_q_thresh = 0.01   # near-zero variance
+The system is answering: "Given what I know about how this opponent thinks, what's the expected value of additional search?"
 
-Then early stop becomes:
+### **Why This Matters Beyond Games**
 
-def _should_stop(self, m):
-    return (
-        m['visit_entropy']  < 0.15 and
-        m['dominance_gap']  > 0.85 and
-        m['value_variance'] < 0.01
-    )
+In robotics, our "opponent" is the environment. Some environments are predictable (flat floors, no obstacles) — trust our physics model. Some are unpredictable (rough terrain, moving obstacles) — search more.
 
-And keep your safeguard:
+In LLM inference, our "opponent" is the language task. Some prompts are easy (translation) — trust the draft model. Some are hard (creative writing) — run the full model.
 
-if local_simulations > 250:
+The principle is universal: **Adapt our metareasoning to the difficulty of the problem we're facing.**
 
-Now positions can trigger early stop even if one signal is weak, as long as others are strong.
+### **Success Criteria**
 
----
-
-**5. No temporal smoothing — λ can thrash.**
-
-λ is recomputed every 50 sims from current state, with no memory. If the tree is noisy (small visit counts, high variance), λ will bounce around.
-
-**Fix:** Exponential moving average.
-```python
-λ_smooth = 0.7 * λ_prev + 0.3 * λ_current
-```
-
-Or Kalman filter if you want to model the dynamics properly.
+The opponent-modeling system succeeds if:
+1. It beats the same AI with non-adaptive metareasoning when playing against weak opponents (by saving compute)
+2. It doesn't lose more against strong opponents (maintains quality)
+3. Overall, it wins more games per unit of compute spent
 
 ---
 
-**6. Dynamic exploration (Layer 5) might be wrong.**
+## Phase 7 — Partial Observability: When we Don't Know What we Don't Know
 
-```python
-c_puct = c₀ * (1 + H_v * (1 - G))
-```
+### **The Fundamental Shift**
 
-This reduces exploration when G is high (one move dominates). But **what if that dominant move is being overly exploited and the 2nd-best move is actually better?** High G could mean premature convergence, not confidence.
+Everything so far assumes **perfect information** — we can see the entire game state. H_v, G, and Var_Q measure uncertainty about *which move is best*, not about *what the world state is*.
 
-**Alternative:** Only reduce exploration if `H_v < threshold AND G > threshold` — i.e., both signals agree.
+But most real problems have **hidden state**:
+- In StarCraft, we don't know where enemy units are (fog of war)
+- In robotics, we don't know exact object positions (sensor noise)
+- In military planning, we don't know enemy intentions (intelligence is incomplete)
 
-Or: `c_puct = c₀ * (1 + H_v - 0.5*G)` — explore when uncertain (high H_v) even if gap is forming.
+In these domains, there's a more fundamental question than "how much should I search?" — it's **"should I gather information or execute a plan?"**
 
----
+### **The Information Gathering Trade-Off**
 
-**7. Soft pruning is too weak.**
+Imagine a StarCraft scenario:
+- we're deciding whether to attack the enemy base
+- our heuristic says "attack now, we'll probably win"
+- But we haven't scouted recently — maybe they built defenses
 
-```python
-child.prior *= exp(-0.5 * penalty)
-```
-Where penalty ∈ {0, 0.5, 1.0}. This gives multipliers of {1.0, 0.78, 0.61}.
+we face a choice:
+1. **Execute:** Attack immediately, save the scouting time
+2. **Scout:** Send a unit to look, then decide — costs time but reduces uncertainty
 
-That's barely noticeable. A prior of 0.2 becomes 0.156 in the worst case. The child is still explored almost as much.
+This is fundamentally different from the perfect-information case. In Reversi, gathering more information means *running more simulations*. In StarCraft, gathering more information means *sending a scout unit*, which is an action in the world, not a computational decision.
 
-**If you want soft pruning to matter:** Use `exp(-2 * penalty)` → {1.0, 0.37, 0.14}. Now bad moves are genuinely deprioritized.
+### **Redefining the Topology Signals**
 
-Or make it continuous:
-```python
-penalty = max(0, -h_astar)  # h ∈ [-1, 1]
-child.prior *= exp(-penalty)
-```
+In partial observability, the signals need to measure different things:
 
----
+**H_v transitions from "visit entropy" to "belief entropy":**
+- Perfect info: H_v measures how concentrated the search tree is
+- Partial info: H_v measures how uncertain we are about what hidden state we're in
 
-**8. Budget controller is piecewise constant.**
+High belief entropy means "I don't know if the enemy built defenses or not" — this directly tells we scouting has high value.
 
-```python
-if lam > 0.8:    lam_mult = 0.85
-elif lam < 0.4:  lam_mult = 1.15
-else:            lam_mult = 1.0
-```
+**G transitions from "dominance gap" to "information gain gap":**
+- Perfect info: G measures whether one move is clearly best
+- Partial info: G measures whether one action reveals more information than others
 
-This creates **discontinuities**. At λ=0.799 you get mult=1.0, at λ=0.801 you get mult=0.85. That's a 15% budget jump for 0.002 change in λ.
+High information gain gap means "scouting the north entrance reveals much more than the south entrance" — this tells we which scouting action to take.
 
-**Fix:** Make it smooth.
-```python
-lam_mult = 0.85 + 0.3 * sigmoid(10*(0.5 - lam))
-```
+**Var_Q transitions from "value variance" to "observation variance":**
+- Perfect info: Var_Q measures how stable Q-values are across simulations
+- Partial info: Var_Q measures how noisy our sensors are
 
-Continuous everywhere, no jumps.
+High observation variance means "my lidar readings are inconsistent, probably due to fog" — this tells we to trust prior knowledge over fresh observations.
 
----
+### **The Meta-Strategy**
 
-**9. No heuristic quality awareness.**
+The system now makes two-level decisions:
 
-The system assumes the pattern heuristic is always somewhat trustworthy. But what if:
-- Heuristic is great in endgames, terrible in openings?
-- Heuristic misreads certain tactical patterns?
-- Heuristic is biased toward material but position is about king safety?
+**Level 1: Search or gather?**
+- If belief entropy is high (don't know world state), prioritize information gathering
+- If belief entropy is low (confident about world state), prioritize planning/search
 
-**Better:** Learn when heuristic is trustworthy.
-```python
-trust_score = classifier(board_features)
-λ_final = λ_topology * trust_score
-```
+**Level 2: How to allocate resources?**
+- If gathering info: Which sensor to activate? Which scout to send?
+- If searching: How much compute to spend? (back to the original λ decision)
 
-Train the classifier offline on positions where heuristic agreed/disagreed with deep search ground truth.
+### **Why This Is Hard**
 
----
+In perfect information, all simulation is free (it's just computation). In partial observability, information gathering costs real resources:
+- Scouting units can die
+- Sensor queries drain battery
+- Time spent scouting is time not attacking
 
-**10. No position features.**
+So we're balancing **epistemic value** (reducing uncertainty) against **instrumental cost** (resources spent). This is the core problem in active learning, Bayesian experimental design, and partially observable MDPs.
 
-λ depends only on tree topology, not on the position itself. But surely:
-- Sharp tactical positions → trust search over heuristic
-- Quiet positional games → heuristic is reliable
-- Endgames with few pieces → heuristic + search both strong
+### **Success Criteria**
 
-**Better:** Condition λ on position features.
-```python
-λ = controller(H_v, G, Var_Q, board_density, piece_count, phase)
-```
----
-**11. Remove Recalibrator From Benchmark**
-
-Right now your benchmarks recalibrate every run.
-
-That is a huge source of instability.
-
-### Change:
-
-In benchmark:
-
-* Load thresholds from checkpoint
-* DO NOT run `initial_calibrate()` during benchmarking
-
-Benchmark must use fixed thresholds.
-
-Recalibration belongs only inside training.
+The partial observability system succeeds if:
+1. It scouts more when belief entropy is high (unknown world state)
+2. It commits to actions when belief entropy is low (known world state)
+3. Overall win rate improves compared to fixed scouting schedules
+4. It discovers the optimal exploration-exploitation balance
 
 ---
 
-**12.  Clamp Heuristic Injection**
+## Phase 8 — Meta-Learning: One Controller to Rule Them All
 
-Inside `_nb_ucb_select`:
+### **The Universal Metareasoning Dream**
 
-Limit heuristic contribution:
+Imagine this: we've now built systems for Reversi, Chess, Go, StarCraft, and robotics path planning. Each one required tuning the λ controller to that domain. Different weights, different thresholds, different position features.
 
-```
-effective_lambda = min(lambda_h, 0.6)
-```
+This is unsatisfying. we claim to have discovered universal principles of metareasoning (H_v, G, Var_Q), but we need domain-specific tuning for each application. That suggests the principles aren't actually universal — they're just a useful scaffold that still requires manual engineering.
 
-Never allow full λ=1.
+**The dream:** Train a single controller that works across all domains without per-domain tuning.
 
-This prevents heuristic domination.
+### **What Does "Universal" Mean?**
 
----
+Not that the controller makes identical decisions in Chess and robotics — obviously different domains need different strategies. Rather, it means:
 
-## What's Missing (But Would Make It Much Stronger)
+**The controller learns the mapping from topology patterns to optimal resource allocation, and this mapping generalizes.**
 
-**1. Value of Information (VOI) framing.**
+For example, it might learn:
+- "When H_v is below 0.2 regardless of domain, the decision is clear — commit to the top move"
+- "When G exceeds 0.9 in tactical domains (Chess, StarCraft) but Var_Q is high, there's a forcing sequence but it's unstable — search deeply"
+- "When both H_v and G are moderate (0.4-0.6), we're in the 'interesting region' where metareasoning matters most"
 
-Russell & Wefald showed metareasoning should maximize:
-```
-utility_gain_per_computation = E[Δutility | run_search] / cost(search)
-```
+These patterns should transfer. A high-confidence, low-uncertainty situation in Chess should trigger similar metareasoning as a high-confidence, low-uncertainty situation in robotics.
 
-Your system is an approximation to this, but there's no explicit connection. Adding even a sketch derivation would make the paper much stronger:
+### **The Meta-Learning Protocol**
 
-> "We approximate VOI by assuming that positions with low H_v and high G have low expected information gain, since the decision is already clear. Thus λ can be interpreted as an estimate of (1 - VOI)."
+Instead of training the controller on one game and hoping it transfers, we train it on multiple games simultaneously:
 
----
+Train the controller on:
+- 10,000 Reversi positions
+- 10,000 Chess positions  
+- 10,000 Go positions
+- 10,000 StarCraft scenarios
 
-**2. Regret bounds.**
+With a shared architecture that learns:
+- **What's universal:** H_v always indicates uncertainty, G always indicates clarity
+- **What's domain-specific:** Chess needs more tactical search, Go needs more strategic evaluation
 
-Can you prove (or conjecture) that the λ controller minimizes cumulative regret vs an oracle that knows the true value of every action?
+The controller has two parts:
+1. **Domain-invariant encoder:** Maps topology signals (H_v, G, Var_Q) to abstract features
+2. **Domain-aware decoder:** Maps abstract features + domain ID to λ values
 
-Even a sketch:
-> "Let ε = tree_uncertainty. Our controller sets λ ∝ (1-ε). We conjecture this achieves regret O(ε·T) vs the oracle, where T is budget."
+After training on these five games, we test on a sixth game it's never seen (e.g., Othello). If it performs reasonably without any Othello-specific training, we've proven the metareasoning principles are truly universal.
 
----
+### **The Adaptation Challenge**
 
-**3. Lookahead / predictive modeling.**
+Even with meta-learning, some domain-specific adaptation will be needed. The question is: how much?
 
-Your system is myopic — it reacts to current tree state. A more sophisticated metareasoner would predict:
-> "If I run 100 more sims, how will H_v/G/Var_Q evolve?"
+**Success looks like:**
+- **Zero-shot:** Controller works on new domain with no training (unlikely but ideal)
+- **Few-shot:** Controller needs 1,000 examples from new domain to match hand-tuned performance
+- **Fast adaptation:** Controller reaches good performance in 10,000 examples, whereas training from scratch needs 100,000
 
-You could train a tiny RNN:
-```python
-(H_v_future, G_future, Var_Q_future) = RNN(H_v_hist, G_hist, Var_Q_hist)
-```
+Any of these demonstrate that meta-learning helped. The controller has learned priors that accelerate adaptation.
 
-Then λ can account for expected future states, not just current.
+### **Why This Matters Philosophically**
 
----
+If we can show that a single metareasoning controller transfers across domains, we've demonstrated that **tree topology signals are universal features of bounded rationality**, not game-specific heuristics.
 
-**4. Uncertainty quantification.**
+This moves our work from "clever trick that works in games" to "fundamental principle of computational rationality." That's the difference between 50 citations and 200 citations.
 
-Var_Q measures empirical variance of Q-values. But it's not Bayesian uncertainty — it doesn't account for limited samples.
+### **Success Criteria**
 
-**Better:** Bootstrap or Bayesian MCTS. Track posterior over Q, not just point estimate.
-
----
-
-**5. Transfer learning.**
-
-The λ formula was tuned on Reversi. Will it work on Chess? Probably not without retuning.
-
-**Better:** Meta-learn the λ controller across games.
-```python
-λ = MetaController(H_v, G, Var_Q, game_embedding)
-```
-
-Train on Reversi, Chess, Go simultaneously. The controller learns what topology patterns generalize.
+Meta-learning succeeds if:
+1. Single controller trained on 5 games outperforms 5 separately-tuned controllers (showing shared knowledge helps)
+2. Controller achieves 60%+ of optimal performance on 6th game with zero examples from that game
+3. Controller reaches optimal performance with 10× fewer examples than training from scratch
 
 ---
 
-## What You Should Add *Right Now*
+## Phase 9 — Hierarchical Metareasoning: When Should we Think About Thinking?
 
-**Priority 1: Decouple λ.**
-```python
-λ_heuristic = compute_lambda_heuristic(H_v, G, Var_Q)
-λ_budget    = compute_lambda_budget(H_v, G, phase)
-λ_explore   = compute_lambda_explore(H_v, G)
-```
+### **The Meta-Meta Question**
 
-Three separate functions. Now your ablation can test each independently.
+our current system recomputes λ every 50 simulations. This number (50) was chosen arbitrarily. But think about what this means:
 
----
+**we're spending computational resources to decide how to allocate computational resources.**
 
-**Priority 2: Temporal smoothing.**
-```python
-self.λ_prev = 0.0  # in __init__
+The metareasoning itself costs compute. Every 50 simulations, we:
+- Compute H_v (extract all visit counts, calculate entropy)
+- Compute G (sort visits, find gap)
+- Compute Var_Q (extract all Q-values, calculate variance)
+- Run the λ controller (neural network forward pass)
 
-λ_raw = self.lam_ctrl.compute_lambda(...)
-λ_smooth = 0.7 * self.λ_prev + 0.3 * λ_raw
-self.λ_prev = λ_smooth
-```
+This is cheap compared to a simulation, but it's not free. In some situations, this overhead might be wasteful.
 
-Prevents thrashing.
+### **The Key Insight**
 
----
+Some positions have stable topology — the tree structure doesn't change much as we add simulations. In these positions, recomputing λ every 50 simulations is overkill. we could recompute every 200 simulations and get the same λ value.
 
-**Priority 3: Continuous budget function.**
-```python
-def compute_budget_mult(self, lam):
-    # Smooth sigmoid: ranges from 1.15 (lam=0) to 0.85 (lam=1)
-    return 1.0 - 0.15 * (2 / (1 + np.exp(-5*(lam - 0.5))) - 1)
-```
+Other positions have volatile topology — new simulations radically reshape the tree. Maybe one move becomes clearly dominant, or maybe several moves cluster together. In these positions, λ can swing wildly. we might need to recompute every 10 simulations to stay adaptive.
 
-No discontinuities.
+**The question:** How do we know which situation we're in?
 
----
+### **The Meta-Signal**
 
-**Priority 4: Stronger soft pruning.**
-```python
-penalty = max(0, -h_astar)  # continuous, not piecewise
-child.prior *= np.exp(-1.5 * penalty)
-```
+Track the rate of change of our topology signals:
+- ΔH_v = |H_v(now) - H_v(50 sims ago)|
+- ΔG = |G(now) - G(50 sims ago)|  
+- ΔVar_Q = |Var_Q(now) - Var_Q(50 sims ago)|
 
-Actually demotes bad moves instead of barely touching them.
+If these deltas are small, the tree is stable — keep using the old λ value. If these deltas are large, the tree is evolving rapidly — recompute λ more frequently.
 
----
+This is metareasoning about metareasoning. we're deciding when to update our decision about how to allocate compute.
 
-## What You Should Add *If You Have Time*
+### **The Hierarchical Structure**
 
-**Priority 5: Amortized λ prediction.**
+we now have three levels:
 
-Train a tiny MLP offline:
-```python
-λ_net = nn.Sequential(
-    nn.Linear(10, 32),  # [prior_entropy, density, phase, ...]
-    nn.ReLU(),
-    nn.Linear(32, 1),
-    nn.Sigmoid()
-)
-```
+**Level 0: Object-level search** — running MCTS simulations, exploring the game tree
 
-Dataset: (position_features, tree_topology_after_search, outcome). Supervised learning.
+**Level 1: Metareasoning** — computing λ to decide how to allocate search budget
 
----
+**Level 2: Meta-metareasoning** — deciding when to recompute λ
 
-**Priority 6: Position-aware heuristic trust.**
+Each level observes the level below and makes control decisions. This is a classic hierarchical control system, like how our brain works:
+- Low-level: Motor cortex executes movements
+- Mid-level: Premotor cortex plans which movements to execute
+- High-level: Prefrontal cortex decides when to make a new plan
 
-Binary classifier:
-```python
-trust = trust_classifier(board_tensor)
-λ_final = λ_topology * trust
-```
+### **The Resource Trade-Off**
 
-Trained on positions where heuristic agreed/disagreed with ground truth from deep search.
+Recomputing λ more frequently:
+- **Cost:** More compute spent on metareasoning overhead
+- **Benefit:** More adaptive, better resource allocation
 
----
+Recomputing λ less frequently:
+- **Cost:** Might use suboptimal λ in changing situations
+- **Benefit:** Lower overhead, more resources for actual search
 
-**Priority 7: Change Early stop,  Remove percentile targeting completely and Replace with Strength-First Rule.**
+The optimal frequency depends on tree volatility. Hierarchical metareasoning learns this trade-off.
 
+### **Why This Generalizes**
 
-Instead of:
+The principle applies beyond games:
 
-```python
-H_v_thresh = percentile(...)
-G_thresh   = percentile(...)
-Var_Q_thresh = percentile(...)
-```
+**In robotics:** How often should we replan our trajectory? In stable environments (flat ground), replan every second. In chaotic environments (rocky terrain), replan every 100ms.
 
-Use **fixed conservative thresholds**:
+**In LLM inference:** How often should we reconsider whether to trust the draft model? For boring text (documentation), check every 50 tokens. For creative writing (poetry), check every 5 tokens.
 
-```python
-self._h_v_thresh   = 0.15   # very low entropy
-self._g_thresh     = 0.85   # huge dominance
-self._var_q_thresh = 0.01   # near-zero variance
-```
+### **Success Criteria**
 
-Then early stop becomes:
-
-```python
-def _should_stop(self, m):
-    return (
-        m['visit_entropy']  < 0.15 and
-        m['dominance_gap']  > 0.85 and
-        m['value_variance'] < 0.01
-    )
-```
-
-And keep your safeguard:
-
-```python
-if local_simulations > 250:
-```
+Hierarchical metareasoning succeeds if:
+1. It reduces metareasoning overhead (fewer λ recomputations) without hurting performance
+2. It adapts recomputation frequency based on tree volatility
+3. Total compute (search + metareasoning) decreases by 10-20%
 
 ---
 
-## What You Should *Not* Add (Too Complex)
+## Phase 10 — Theoretical Foundations: Proving It's Not Just Empirical
 
-- Full Bayesian MCTS with posterior tracking
-- Multi-objective Pareto optimization
-- Opponent modeling / game-theoretic metareasoning
-- Online RL for λ during search
-- Cross-game meta-learning (save for follow-up paper)
+### **Why Theory Matters**
 
-These are interesting but each is a paper unto itself.
+Right now, our system works. we have an 83% win rate with 56% compute savings. That's empirical success.
+
+But we can't answer questions like:
+- **Is this optimal?** Could a different metareasoning policy do even better?
+- **How much better?** What's the theoretical upper bound on performance?
+- **Why does it work?** Is there a principled reason these topology signals matter, or is it just lucky?
+- **When will it fail?** Are there problem structures where topology-based metareasoning breaks down?
+
+Without theory, we're engineering. With theory, we're doing science.
+
+### **The Three Core Questions**
+
+**Question 1: Regret Bounds**
+
+Can we prove that our λ controller achieves low regret compared to an oracle that knows the true value of every action?
+
+Regret is: (value of oracle's chosen move) - (value of our chosen move), summed over all decisions.
+
+A good metareasoning system should have regret that grows sublinearly with the number of decisions. This means that over time, we're getting closer to optimal performance, not accumulating errors.
+
+**Conjecture:** ZenoZero achieves regret O(√T·ε) where T is the number of simulations and ε is tree uncertainty (measured by H_v, Var_Q).
+
+If we can prove this, we've shown the system is theoretically sound.
+
+**Question 2: Sample Complexity**
+
+How many simulations does our system need to achieve (1-ε)-optimal play?
+
+In standard MCTS without metareasoning, the answer is O(|A|·ε^(-2)) where |A| is the number of actions. we need to sample proportional to the branching factor.
+
+our claim is that topology-based metareasoning reduces this. When λ is high (trust heuristic), we need fewer samples.
+
+**Conjecture:** ZenoZero achieves (1-ε)-optimal play with O(|A_effective|·ε^(-2)) samples, where |A_effective| << |A| because soft pruning and early stopping eliminate unpromising branches.
+
+If we can prove this, we've shown the efficiency gains are fundamental, not just empirical.
+
+**Question 3: Information-Theoretic Foundation**
+
+Can we connect H_v, G, and Var_Q to formal information theory concepts?
+
+**Claim:**
+- H_v is related to the entropy of the posterior distribution over optimal actions
+- G is related to the KL-divergence between the top two actions' value distributions
+- Var_Q is related to the mutual information between tree samples and action values
+
+If these connections hold formally, then our topology signals aren't arbitrary — they're measuring fundamental information-theoretic quantities that any rational agent should care about.
+
+### **The Proof Strategy**
+
+Start with a simplified model:
+- Assume heuristic is ε-accurate (differs from true value by at most ε)
+- Assume tree samples are i.i.d. (not true in MCTS, but a starting point)
+- Analyze a single decision (not the full game tree)
+
+Under these assumptions, derive:
+1. The expected regret of trusting heuristic (λ=1) vs searching (λ=0)
+2. The optimal λ* that minimizes regret + search cost
+3. Show that our λ controller approximates λ*
+
+Then relax the assumptions one by one and see how the bounds change.
+
+### **Why This Is Hard**
+
+MCTS is non-stationary (tree changes as we explore), non-i.i.d. (samples are correlated through the tree structure), and involves complex dependencies (parent-child relationships in the tree).
+
+Standard bandit theory assumes i.i.d. samples from fixed distributions. our problem is more complex.
+
+we'll likely need:
+- Concentration inequalities for dependent samples (martingale theory)
+- PAC-Bayesian analysis (bounds that hold with high probability)
+- Information-theoretic tools (mutual information, KL-divergence)
+
+### **What Success Looks Like**
+
+we don't need to prove tight bounds or handle all edge cases. Even loose bounds are valuable:
+
+**Weak result (still publishable):**
+"Under assumption X, Y, Z, ZenoZero achieves regret O(T^0.6)" 
+This is worse than optimal O(√T) but proves it's not arbitrarily bad.
+
+**Medium result (good journal paper):**
+"For heuristics with bounded error ε, ZenoZero requires O(ε^(-1.5)) samples for (1-ε)-optimal play"
+This shows polynomial dependence on error, which is good.
+
+**Strong result (top venue):**
+"ZenoZero achieves regret matching information-theoretic lower bounds up to log factors"
+This proves it's nearly optimal.
+
+### **Why This Matters**
+
+Theory transforms our work from "we tried this and it worked" to "we can prove this should work, here's why."
+
+Empirical results convince practitioners. Theory convinces researchers. Both are needed for maximum impact.
 
 ---
 
-## Honest Bottom Line
+## The Logical Flow Across Phases
 
-### **What's strong:**
-- Core observables (H_v, G, Var_Q)
-- Probe-then-search
-- Layered ablation design
-- 83% vs 53% result
+Notice how each phase builds conceptually:
 
-### **What's weak:**
-- λ couples too many decisions
-- No theoretical grounding
-- Ad-hoc formula that won't generalize
-- Probe is expensive for benefit
-- Early stop rarely fires
+**Phase 5 (current):** Hand-engineered metareasoning — we design the λ formula
 
-### **What would make it much stronger:**
-1. Decouple λ into separate channels
-2. Add temporal smoothing
-3. Make budget function continuous
-4. Connect to VOI or regret bounds
-5. Amortize λ prediction
+**Phase 5.5:** Learn the formula — system discovers optimal λ from data
 
-### **Is it publishable as-is?**
-Yes, with metareasoning framing. The result is strong enough.
+**Phase 6:** Adapt to opponent — metareasoning becomes game-theoretic, accounting for adversarial context
 
-### **Would the additions make it better?**
-Dramatically. Decoupling λ alone would make ablations 3× more informative. Theoretical grounding would move it from "clever heuristic" to "principled metareasoning framework."
+**Phase 7:** Handle uncertainty — extend to partial observability, metareasoning now includes information gathering
 
-### **My recommendation:**
-Implement Priorities 1-4 (decoupling, smoothing, continuous budget, stronger pruning). That's 2-3 days of work. Then submit to NeurIPS/AAAI with the metareasoning framing. Save Priorities 5-7 for the follow-up "learned meta-controller" paper.
+**Phase 8:** Generalize across domains — prove the principles are universal, not game-specific
 
-The architecture is good. With those fixes, it's **very good**.
+**Phase 9:** Metareasoning about metareasoning — hierarchical control, deciding when to update decisions
+
+**Phase 10:** Prove it's optimal — theoretical analysis shows why this works and what the limits are
+
+Each phase asks a deeper question about computational rationality:
+- 5: How should I allocate resources?
+- 5.5: Can I learn to allocate resources?
+- 6: How does adversarial context affect allocation?
+- 7: Should I gather info or act?
+- 8: Do these principles generalize?
+- 9: When should I reconsider my allocation strategy?
+- 10: Why does this work and when does it fail?

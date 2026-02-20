@@ -87,6 +87,11 @@ def get_config() -> argparse.Namespace:
                    help='Budget for baseline-vs-baseline compute control run')
     p.add_argument('--seed',         type=int,  default=42,
                    help='Global random seed for reproducibility')
+    p.add_argument('--seeds',        type=str,  default=None,
+                   help='Comma-separated seeds for multi-seed ablation, e.g. "42,1,7". '
+                        'Overrides --seed when ablation is enabled. '
+                        'Each seed runs the full ablation suite independently; '
+                        'results are aggregated and a summary table is printed.')
     return p.parse_args()
 
 
@@ -293,9 +298,30 @@ def run_matchup(
 
 def get_ablation_configs(min_budget: int = 80, max_budget: int = 900) -> List[Tuple[str, dict]]:
     """
-    Ordered ablation: start from pure baseline, add layers one by one.
-    Each config dict maps directly to TopologyAwareMCTS keyword args.
+    Ablation suite — three sections:
+
+    Section A — additive: start from nothing, add layers one by one.
+                Shows marginal contribution of each layer.
+
+    Section B — leave-one-out: start from full system, remove one layer.
+                Shows what each layer is actually worth in context.
+
+    Section C — L4/L5 coupling diagnostic.
+                Isolates whether dynamic exploration (L5) is independently
+                useful or purely compensating for dynamic λ (L4) instability.
+                Key question: does L5 help when L4 is absent?
     """
+    all_on = dict(
+        enable_heuristic=True,
+        enable_soft_pruning=True,
+        enable_dynamic_lambda=True,
+        enable_dynamic_exploration=True,
+        enable_early_stop=True,
+        enable_lambda_budget=True,
+        enable_logging=False,
+        min_budget=min_budget,
+        max_budget=max_budget,
+    )
     base = dict(
         enable_heuristic=False,
         enable_soft_pruning=False,
@@ -307,50 +333,58 @@ def get_ablation_configs(min_budget: int = 80, max_budget: int = 900) -> List[Tu
     )
 
     configs = [
-        ("Topology (all layers)", dict(
-            enable_heuristic=True,
-            enable_soft_pruning=True,
-            enable_dynamic_lambda=True,
-            enable_dynamic_exploration=True,
-            enable_early_stop=True,
-            enable_lambda_budget=True,
-            enable_logging=False,
-            min_budget=min_budget,
-            max_budget=max_budget,
-        )),
-        ("+L2 only (fixed heuristic, λ=0.05)", dict(
+        # ── Section A: additive ───────────────────────────────────────────────
+        ("A1: +L2 only (heuristic, fixed λ=0.05)", {
             **base,
-            enable_heuristic=True,
-        )),
-        ("+L2+L4 (heuristic + dynamic λ)", dict(
+            'enable_heuristic': True,
+        }),
+        ("A2: +L2+L4 (+ dynamic λ)", {
             **base,
-            enable_heuristic=True,
-            enable_dynamic_lambda=True,
-        )),
-        ("+L2+L4+L5 (+ dynamic exploration)", dict(
+            'enable_heuristic': True,
+            'enable_dynamic_lambda': True,
+        }),
+        ("A3: +L2+L4+L5 (+ dynamic exploration)", {
             **base,
-            enable_heuristic=True,
-            enable_dynamic_lambda=True,
-            enable_dynamic_exploration=True,
-        )),
-        ("+L2+L4+L5+L6 (+ early stop)", dict(
+            'enable_heuristic': True,
+            'enable_dynamic_lambda': True,
+            'enable_dynamic_exploration': True,
+        }),
+        ("A4: +L2+L4+L5+L6 (+ early stop)", {
             **base,
-            enable_heuristic=True,
-            enable_dynamic_lambda=True,
-            enable_dynamic_exploration=True,
-            enable_early_stop=True,
-        )),
-        ("+All layers (full system)", dict(
-            enable_heuristic=True,
-            enable_soft_pruning=True,
-            enable_dynamic_lambda=True,
-            enable_dynamic_exploration=True,
-            enable_early_stop=True,
-            enable_lambda_budget=True,
-            enable_logging=False,
-            min_budget=min_budget,
-            max_budget=max_budget,
-        )),
+            'enable_heuristic': True,
+            'enable_dynamic_lambda': True,
+            'enable_dynamic_exploration': True,
+            'enable_early_stop': True,
+        }),
+        ("A5: All layers (full system)", dict(**all_on)),
+
+        # ── Section B: leave-one-out ──────────────────────────────────────────
+        ("B1: Full − soft pruning (L3)", {
+            **all_on,
+            'enable_soft_pruning': False,
+        }),
+        ("B2: Full − budget allocator (L7)", {
+            **all_on,
+            'enable_lambda_budget': False,
+        }),
+
+        # ── Section C: L4/L5 coupling diagnostic ─────────────────────────────
+        ("C1: L2+L5 only (explore, NO dynamic λ)", {
+            **base,
+            'enable_heuristic': True,
+            'enable_dynamic_exploration': True,
+        }),
+        ("C2: L2+L4 only (dynamic λ, NO explore)", {
+            **base,
+            'enable_heuristic': True,
+            'enable_dynamic_lambda': True,
+        }),
+        ("C3: L2+L4+L5 (both — coupling check)", {
+            **base,
+            'enable_heuristic': True,
+            'enable_dynamic_lambda': True,
+            'enable_dynamic_exploration': True,
+        }),
     ]
     return configs
 
@@ -374,7 +408,15 @@ def worker_fn(worker_games, start_idx, result_q,
               thresholds,
               topology_config,
               baseline_budget,
-              temperature):
+              temperature,
+              master_seed,
+              worker_id):
+
+    import random as _random
+    # Deterministic per-worker seed derived from master — reproducible across runs
+    worker_seed = master_seed + worker_id
+    np.random.seed(worker_seed)
+    _random.seed(worker_seed)
 
     from reversi_phase5_topology_core import (
         ReversiGame, TacticalSolver, PatternHeuristic, CompactReversiNet
@@ -420,6 +462,7 @@ def run_matchup_parallel(
     baseline_budget:int,
     topology_config:dict,
     num_workers:    int,
+    master_seed:    int = 42,
 ) -> MatchupResult:
     """
     Parallel version of run_matchup.
@@ -454,6 +497,8 @@ def run_matchup_parallel(
                 topology_config,
                 baseline_budget,
                 temperature,
+                master_seed,
+                wid,
             ),
         )
 
@@ -503,8 +548,14 @@ def run_matchup_parallel(
 
 
 def baseline_worker_fn(num_games, start_idx, result_q,
-                       state_dict, budget_a, budget_b, temperature):
+                       state_dict, budget_a, budget_b, temperature,
+                       master_seed, worker_id):
     """Worker for baseline-vs-baseline parallel games."""
+    import random as _random
+    worker_seed = master_seed + worker_id
+    np.random.seed(worker_seed)
+    _random.seed(worker_seed)
+
     from reversi_phase5_topology_core import (
         ReversiGame, TacticalSolver, CompactReversiNet
     )
@@ -566,9 +617,10 @@ def run_baseline_vs_baseline(
     net:           CompactReversiNet,
     num_games:     int,
     temperature:   float,
-    budget_a:      int,   # "strong" baseline
-    budget_b:      int,   # "weak" baseline (compute-matched to ZenoZero)
+    budget_a:      int,
+    budget_b:      int,
     num_workers:   int = 1,
+    master_seed:   int = 42,
 ) -> MatchupResult:
     """
     Pits Baseline-A (budget_a sims) against Baseline-B (budget_b sims).
@@ -600,6 +652,8 @@ def run_baseline_vs_baseline(
                     budget_a,
                     budget_b,
                     temperature,
+                    master_seed,
+                    wid,
                 ),
             )
             p.start()
@@ -691,6 +745,72 @@ def run_baseline_vs_baseline(
         p_value=float(binom.pvalue),
         significant=bool(binom.pvalue < 0.05),
     )
+def _print_multiseed_summary(seed_results: List[List[dict]], seeds: List[int]):
+    """
+    Aggregate ablation results across multiple seeds.
+    seed_results[i] = list of result dicts for seed i (one per ablation config).
+    Prints mean WR ± std, mean savings, and consistency flag.
+    """
+    if not seed_results or not seed_results[0]:
+        return
+
+    n_configs = len(seed_results[0])
+    n_seeds   = len(seeds)
+
+    print(f"\n\n  {'═'*72}")
+    print(f"  MULTI-SEED ABLATION SUMMARY  ({n_seeds} seeds: {seeds})")
+    print(f"  {'═'*72}")
+    print(f"  {'Configuration':<42} {'WR mean':>8}  {'±std':>6}  {'Savings':>8}  {'Consistent':>10}")
+    print(f"  {'─'*72}")
+
+    for ci in range(n_configs):
+        name = seed_results[0][ci]['name']
+        wrs      = [seed_results[si][ci]['win_rate']       for si in range(n_seeds)]
+        savings  = [seed_results[si][ci]['sim_savings_pct'] for si in range(n_seeds)]
+        sigs     = [seed_results[si][ci]['significant']     for si in range(n_seeds)]
+
+        mean_wr   = float(np.mean(wrs))
+        std_wr    = float(np.std(wrs))
+        mean_sav  = float(np.mean(savings))
+        # Consistent = all seeds agree on significance direction
+        all_sig   = all(sigs)
+        none_sig  = not any(sigs)
+        consistent = "✓ all sig" if all_sig else ("✓ none sig" if none_sig else "~ mixed")
+
+        print(f"  {name:<42} {mean_wr:>7.1%}  {std_wr:>6.1%}  {mean_sav:>+7.1f}%  {consistent:>10}")
+
+    print(f"  {'─'*72}")
+
+    # Section C coupling verdict
+    c_names = [r['name'] for r in seed_results[0]]
+    c1_idx = next((i for i,n in enumerate(c_names) if n.startswith('C1')), None)
+    c2_idx = next((i for i,n in enumerate(c_names) if n.startswith('C2')), None)
+    c3_idx = next((i for i,n in enumerate(c_names) if n.startswith('C3')), None)
+
+    if c1_idx is not None and c2_idx is not None and c3_idx is not None:
+        c1_wr = np.mean([seed_results[si][c1_idx]['win_rate'] for si in range(n_seeds)])
+        c2_wr = np.mean([seed_results[si][c2_idx]['win_rate'] for si in range(n_seeds)])
+        c3_wr = np.mean([seed_results[si][c3_idx]['win_rate'] for si in range(n_seeds)])
+
+        print(f"\n  L4/L5 COUPLING VERDICT:")
+        print(f"    C1 (L5 alone, no L4):    WR={c1_wr:.1%}")
+        print(f"    C2 (L4 alone, no L5):    WR={c2_wr:.1%}")
+        print(f"    C3 (L4+L5 together):     WR={c3_wr:.1%}")
+        synergy = c3_wr - max(c1_wr, c2_wr)
+        if c1_wr < 0.52 and c2_wr < 0.52 and c3_wr > 0.60:
+            verdict = "ACCIDENTAL COMPENSATION — neither helps alone, together they cancel instability"
+        elif c1_wr > 0.57 and abs(c3_wr - c1_wr) < 0.05:
+            verdict = "L5 INDEPENDENT — L5 useful alone, L4 adds little on top"
+        elif c1_wr > 0.57 and c3_wr > c1_wr:
+            verdict = "GENUINE SYNERGY — L5 helps alone AND further improves with L4"
+        elif c2_wr < 0.50 and c3_wr > 0.57:
+            verdict = "L5 CORRECTS L4 — L4 hurts alone, L5 rescues it (compensation)"
+        else:
+            verdict = f"INCONCLUSIVE — synergy delta={synergy:+.1%}, need more games"
+        print(f"    → {verdict}")
+    print(f"  {'═'*72}\n")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -707,7 +827,8 @@ def main():
     print(f"  Baseline budget:   {cfg.baseline_budget}")
     print(f"  Topology budget:   [{cfg.min_budget}, {cfg.max_budget}] (difficulty-proportional)")
     print(f"  Ablation:          {cfg.ablation}")
-    print(f"  Seed:              {cfg.seed}")
+    seeds = [int(s.strip()) for s in cfg.seeds.split(',')] if cfg.seeds else [cfg.seed]
+    print(f"  Seeds:             {seeds}")
     print(f"{'='*65}\n")
 
     # ── Determinism ───────────────────────────────────────────────────────────
@@ -769,52 +890,85 @@ def main():
         temperature=cfg.temperature,
         baseline_budget=cfg.baseline_budget,
         topology_config=full_config,
-        **({"num_workers": cfg.workers} if cfg.parallel_games else {}),
+        **({"num_workers": cfg.workers, "master_seed": cfg.seed} if cfg.parallel_games else {}),
     )
 
     print_result(main_result)
     all_results.append(asdict(main_result))
     print(f"\n  Main matchup done in {time.time()-t0:.1f}s")
 
-    # ── Ablation matrix ───────────────────────────────────────────────────────
-    ablation_results = []
-    if cfg.ablation:
-        print(f"\n{'─'*65}")
-        print(f"  LAYER ABLATION MATRIX")
-        print(f"{'─'*65}")
-        print(f"  Each config tested for {cfg.games} games vs baseline\n")
+    # ── Ablation matrix (optionally multi-seed) ───────────────────────────────
+    ablation_results = []        # last seed's results (for single-seed compat)
+    seed_results_all = []        # [seed_idx][config_idx] → result dict
 
-        ablation_games = max(50, cfg.games // 2)   # faster for ablation
+    if cfg.ablation:
+        ablation_games = max(50, cfg.games // 2)
         runner = run_matchup_parallel if cfg.parallel_games else run_matchup
 
-        for abl_name, abl_cfg in get_ablation_configs(cfg.min_budget, cfg.max_budget):
-            print(f"\n  Testing: {abl_name}")
-            abl_result = runner(
-                name=abl_name,
-                net=net,
-                thresholds=thresholds,
-                num_games=ablation_games,
-                temperature=cfg.temperature,
-                baseline_budget=cfg.baseline_budget,
-                topology_config=abl_cfg,
-                **({"num_workers": cfg.workers} if cfg.parallel_games else {}),
-            )
-            print_result(abl_result)
-            ablation_results.append(asdict(abl_result))
-            all_results.append(asdict(abl_result))
+        for seed_idx, abl_seed in enumerate(seeds):
+            # Re-seed for this ablation seed
+            import random as _random_abl
+            _random_abl.seed(abl_seed)
+            np.random.seed(abl_seed)
+            torch.manual_seed(abl_seed)
 
-        # Print ablation summary table
-        print(f"\n\n  {'─'*55}")
-        print(f"  ABLATION SUMMARY")
-        print(f"  {'─'*55}")
-        print(f"  {'Configuration':<38} {'WR':>6}  {'Savings':>8}  {'Sig':>5}")
-        print(f"  {'─'*55}")
-        for r_dict in ablation_results:
-            r = MatchupResult(**r_dict)
-            sig = "✓" if r.significant else " "
-            print(f"  {r.name:<38} {r.win_rate:>6.1%}  "
-                  f"{r.sim_savings_pct:>+7.1f}%  {sig:>5}")
-        print(f"  {'─'*55}")
+            print(f"\n{'─'*65}")
+            if len(seeds) > 1:
+                print(f"  LAYER ABLATION MATRIX  [seed {abl_seed}  ({seed_idx+1}/{len(seeds)})]")
+            else:
+                print(f"  LAYER ABLATION MATRIX")
+            print(f"{'─'*65}")
+            print(f"  Each config tested for {ablation_games} games vs baseline\n")
+
+            seed_results = []
+
+            # Section headers for readability
+            section_map = {'A': '── Section A: Additive ──────────────────────────────────',
+                           'B': '── Section B: Leave-one-out ─────────────────────────────',
+                           'C': '── Section C: L4/L5 Coupling Diagnostic ────────────────'}
+            last_section = None
+
+            for abl_name, abl_cfg in get_ablation_configs(cfg.min_budget, cfg.max_budget):
+                section = abl_name[0]  # 'A', 'B', or 'C'
+                if section != last_section and section in section_map:
+                    print(f"\n  {section_map[section]}")
+                    last_section = section
+
+                print(f"\n  Testing: {abl_name}")
+                abl_result = runner(
+                    name=abl_name,
+                    net=net,
+                    thresholds=thresholds,
+                    num_games=ablation_games,
+                    temperature=cfg.temperature,
+                    baseline_budget=cfg.baseline_budget,
+                    topology_config=abl_cfg,
+                    **({"num_workers": cfg.workers, "master_seed": abl_seed} if cfg.parallel_games else {}),
+                )
+                print_result(abl_result)
+                r_dict = asdict(abl_result)
+                seed_results.append(r_dict)
+                all_results.append(r_dict)
+
+            ablation_results = seed_results   # keep last seed for compat
+            seed_results_all.append(seed_results)
+
+            # Per-seed summary table
+            print(f"\n\n  {'─'*60}")
+            print(f"  ABLATION SUMMARY  [seed={abl_seed}]")
+            print(f"  {'─'*60}")
+            print(f"  {'Configuration':<42} {'WR':>6}  {'Savings':>8}  {'Sig':>5}")
+            print(f"  {'─'*60}")
+            for r_dict in seed_results:
+                r = MatchupResult(**r_dict)
+                sig = "✓" if r.significant else " "
+                print(f"  {r.name:<42} {r.win_rate:>6.1%}  "
+                      f"{r.sim_savings_pct:>+7.1f}%  {sig:>5}")
+            print(f"  {'─'*60}")
+
+        # Multi-seed aggregated summary (only when >1 seed)
+        if len(seeds) > 1:
+            _print_multiseed_summary(seed_results_all, seeds)
 
     # Compute control: does ZenoZero beat naive budget reduction?
     if cfg.baseline_vs_baseline:
@@ -829,6 +983,7 @@ def main():
             budget_a=cfg.baseline_budget,
             budget_b=cfg.compute_control_budget,
             num_workers=cfg.workers if cfg.parallel_games else 1,
+            master_seed=cfg.seed,
         )
         print_result(ctrl_result)
         all_results.append(asdict(ctrl_result))

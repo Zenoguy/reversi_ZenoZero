@@ -51,6 +51,7 @@ from reversi_phase5_topology_core import (
 )
 from reversi_phase5_topology_layers import TopologyAwareMCTS, SelfPlayRecord
 from reversi_phase5_dynamic_threshold_recalibrator import DynamicRecalibrator
+from reversi_phase5_baseline import PureMCTS
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -100,13 +101,29 @@ def get_config() -> argparse.Namespace:
                         'thresholds (H_v<0.15, G>0.85, Var_Q<0.01). This value is '
                         'logged alongside the actual stop rate for reference.')
 
+    # Elo evaluation
+    p.add_argument('--elo-interval',     type=int,   default=10,
+                   help='Evaluate Elo every N training iterations. 0 = disabled.')
+    p.add_argument('--elo-games',        type=int,   default=40,
+                   help='Games per Elo evaluation (more = tighter confidence interval). '
+                        '40 games gives ±~70 Elo at 95%% CI; 100 games gives ±~44.')
+    p.add_argument('--elo-budget',       type=int,   default=200,
+                   help='MCTS sim budget for Elo evaluation games. '
+                        'Lower than training budget for speed. 200 is a good tradeoff.')
+    p.add_argument('--elo-k',            type=float, default=32.0,
+                   help='Elo K-factor. 32 = standard for developing players.')
+    p.add_argument('--elo-start',        type=float, default=1500.0,
+                   help='Starting Elo for iteration 1 network.')
+
     # Checkpoints / logging
     p.add_argument('--checkpoint-dir',      type=str,   default='checkpoints')
     p.add_argument('--checkpoint-interval', type=int,   default=5)
     p.add_argument('--log-file',            type=str,   default='training_log.jsonl')
     p.add_argument('--resume',              type=str,   default=None)
-    p.add_argument('--seed',                type=int,   default=42,
-                   help='Main process random seed. Workers use worker_id-based seeds for diversity.')
+    p.add_argument('--seed',                type=int,   default=None,
+                   help='Main process random seed. None = auto-select random seed each run '
+                        '(recommended for training diversity). Workers use master_seed + worker_id '
+                        'so runs are reproducible if seed is specified.')
 
     return p.parse_args()
 
@@ -158,18 +175,21 @@ class ReplayBuffer(Dataset):
 
 def selfplay_worker(
     worker_id:      int,
-    weight_queue:   mp.Queue,   # receives state_dict from main
-    result_queue:   mp.Queue,   # sends List[SelfPlayRecord] to main
-    config_dict:    dict,       # serialisable config
-    calibration:    dict,       # initial thresholds
+    weight_queue:   mp.Queue,
+    result_queue:   mp.Queue,
+    config_dict:    dict,
+    calibration:    dict,
+    master_seed:    int,
 ):
     """
     Runs in a separate process.
     Loops: pull latest weights → play one game → send records → repeat.
+    Seeded as master_seed + worker_id — deterministic across runs with same seed,
+    diverse across workers.
     """
-    # Re-seed per worker so games are diverse
-    np.random.seed(worker_id * 1000 + int(time.time()) % 10000)
-    random.seed(worker_id * 1000 + int(time.time()) % 10000)
+    worker_seed = master_seed + worker_id
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
     net       = CompactReversiNet(8, config_dict['channels'])
     solver    = TacticalSolver()
@@ -235,11 +255,11 @@ def _play_game(
     mcts.total_simulations = 0
     if mcts.lam_ctrl:
         mcts.lam_ctrl.history_heuristic.clear()
-        mcts.lam_ctrl.history_budget.clear()
-        mcts.lam_ctrl.history_explore.clear()
+        mcts.lam_ctrl.history_explore.clear()   # was: history_budget (stale, doesn't exist)
 
     if mcts.budget_ctrl:
-        mcts.budget_ctrl.history.clear()
+        mcts.budget_ctrl.history_budget.clear()
+        mcts.budget_ctrl.history_difficulty.clear()
 
     while not game.game_over:
         legal = game.get_legal_moves()
@@ -333,6 +353,7 @@ def save_checkpoint(
     config:     argparse.Namespace,
     thresholds: dict,
     log:        list,
+    elo_history: Optional[list] = None,
 ):
     torch.save({
         'model_state_dict':     net.state_dict(),
@@ -341,14 +362,192 @@ def save_checkpoint(
         'config':               vars(config),
         'thresholds':           thresholds,
         'log':                  log,
+        'elo_history':          elo_history or [],
     }, path)
 
 
 def load_checkpoint(path: str, net: CompactReversiNet, optimizer: optim.Optimizer):
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
     net.load_state_dict(ckpt['model_state_dict'])
-    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+    if ckpt.get('optimizer_state_dict') is not None:
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+    else:
+        print("  ℹ  No optimizer state in checkpoint (migrated) — Adam starts fresh from LR warmup.")
     return ckpt['iteration'], ckpt.get('thresholds', {}), ckpt.get('log', [])
+
+
+# ── Elo evaluation ────────────────────────────────────────────────────────────
+
+class EloEvaluator:
+    """
+    Tracks network strength via Elo rating through training.
+
+    Method: at every `elo_interval` iterations, play `elo_games` games between
+    the CURRENT network and a frozen REFERENCE network (the weights at the
+    previous evaluation checkpoint).  Update both ratings using the standard
+    Elo formula with K-factor.
+
+    This gives a relative Elo chain: each evaluation measures improvement
+    (or regression) against the previous version of itself.  Comparing iter-50
+    vs iter-100 Elo tells you how much stronger the network became in that
+    window, without needing a fixed external opponent.
+
+    Confidence interval:
+      σ_Elo ≈ 400 / (ln(10) * √N) where N = games played
+      40 games  → ±~70 Elo  (1 σ)
+      100 games → ±~44 Elo
+      200 games → ±~31 Elo
+
+    Both players use PureMCTS (not TopologyAwareMCTS) for Elo games — this
+    isolates network quality from the MCTS controller differences.  The
+    controller's contribution is measured separately in the benchmark.
+    """
+
+    def __init__(
+        self,
+        start_elo: float = 1500.0,
+        k_factor:  float = 32.0,
+        budget:    int   = 200,
+    ):
+        self.k          = k_factor
+        self.budget     = budget
+        self.current_elo: float = start_elo
+        self.ref_elo:     float = start_elo   # reference player starts at same rating
+
+        # History: list of dicts logged per evaluation
+        self.history: List[dict] = []
+
+        # Reference network weights — frozen copy of previous eval checkpoint
+        self._ref_weights: Optional[dict] = None
+
+    def set_reference(self, net: CompactReversiNet):
+        """
+        Snapshot the current network as the new reference.
+        Call this BEFORE updating weights so you compare new vs old.
+        If called with None reference (first time), stores the initial weights.
+        """
+        self._ref_weights = {k: v.clone().cpu() for k, v in net.state_dict().items()}
+
+    def evaluate(
+        self,
+        net:       CompactReversiNet,
+        iteration: int,
+        num_games: int,
+        device:    torch.device,
+    ) -> dict:
+        """
+        Play num_games between current net and reference net.
+        Returns Elo update dict ready to merge into training log.
+
+        If no reference is set (first evaluation), the current network
+        plays against itself — result is always ~50% WR, Elo unchanged.
+        This is correct: we can't measure improvement without a baseline.
+        """
+        if self._ref_weights is None:
+            # First call — store current as reference, report no change
+            self.set_reference(net)
+            entry = {
+                'elo':            self.current_elo,
+                'elo_delta':      0.0,
+                'elo_win_rate':   None,
+                'elo_games':      0,
+                'elo_iteration':  iteration,
+                'elo_note':       'Initial reference set — no comparison yet',
+            }
+            self.history.append(entry)
+            return entry
+
+        # Build reference network
+        ref_net = CompactReversiNet(8, 128)
+        ref_net.load_state_dict(self._ref_weights)
+        ref_net.to(device)
+        ref_net.eval()
+
+        net.eval()
+
+        # Play games — current=Black half, current=White half (remove colour bias)
+        wins = draws = losses = 0
+        solver = TacticalSolver()
+
+        current_mcts = PureMCTS(net,     TacticalSolver(), use_tactical=True)
+        ref_mcts     = PureMCTS(ref_net, TacticalSolver(), use_tactical=True)
+        # Temporarily override class budget for speed
+        _orig_budget = PureMCTS.BUDGET
+        PureMCTS.BUDGET = self.budget
+
+        for i in range(num_games):
+            game = ReversiGame()
+            current_is_black = (i % 2 == 0)
+            current_player   = 1 if current_is_black else -1
+
+            while not game.game_over:
+                legal = game.get_legal_moves()
+                if not legal:
+                    game.make_move(None)
+                    continue
+                if game.current_player == current_player:
+                    move, _, _ = current_mcts.search(game, temperature=0.0)
+                else:
+                    move, _, _ = ref_mcts.search(game, temperature=0.0)
+                game.make_move(move)
+
+            if game.winner == current_player:
+                wins += 1
+            elif game.winner == 0:
+                draws += 1
+            else:
+                losses += 1
+
+        PureMCTS.BUDGET = _orig_budget   # restore
+
+        # Elo update using standard formula
+        score    = (wins + 0.5 * draws) / num_games       # actual score ∈ [0,1]
+        expected = _elo_expected(self.current_elo, self.ref_elo)
+        delta    = self.k * (score - expected)
+
+        old_elo          = self.current_elo
+        self.current_elo = self.current_elo + delta
+        self.ref_elo     = self.ref_elo     - delta   # zero-sum within this pair
+
+        entry = {
+            'elo':           round(self.current_elo, 1),
+            'elo_delta':     round(delta, 1),
+            'elo_win_rate':  round(score, 4),
+            'elo_wins':      wins,
+            'elo_draws':     draws,
+            'elo_losses':    losses,
+            'elo_games':     num_games,
+            'elo_iteration': iteration,
+            'elo_expected':  round(expected, 4),
+            'elo_ci_1sigma': round(_elo_ci(num_games), 1),   # ±Elo at 1σ
+            'elo_note':      (f'vs reference (iter {self.history[-1]["elo_iteration"] if self.history else 0})'
+                              if self._ref_weights else 'vs self'),
+        }
+        self.history.append(entry)
+
+        # Update reference to current weights for NEXT evaluation
+        self.set_reference(net)
+
+        print(f"\n  {'─'*55}")
+        print(f"  ELO EVALUATION  (iter {iteration})")
+        print(f"    Games:    W={wins} D={draws} L={losses}  ({num_games} total)")
+        print(f"    WR:       {score:.1%}  (expected {expected:.1%})")
+        print(f"    Elo:      {old_elo:.0f} → {self.current_elo:.0f}  ({delta:+.0f})")
+        print(f"    95%% CI:  ±{_elo_ci(num_games)*2:.0f} Elo")
+        print(f"  {'─'*55}\n")
+
+        return entry
+
+
+def _elo_expected(rating_a: float, rating_b: float) -> float:
+    """Expected score for player A against player B."""
+    return 1.0 / (1.0 + 10.0 ** ((rating_b - rating_a) / 400.0))
+
+
+def _elo_ci(n_games: int) -> float:
+    """1-sigma Elo confidence interval for n_games."""
+    import math
+    return 400.0 / (math.log(10) * math.sqrt(max(n_games, 1)))
 
 
 # ── Main training loop ────────────────────────────────────────────────────────
@@ -372,13 +571,16 @@ def main():
     print(f"  Batch size:     {cfg.batch_size}")
     print(f"  LR:             {cfg.lr}")
     print(f"  Target stop %%:  {cfg.target_stop_rate*100:.0f}%%")
-    print(f"  Seed:           {cfg.seed}  (workers use worker_id-based seeds)")
+    print(f"  Seed:           {'auto' if cfg.seed is None else cfg.seed}  (workers: master_seed + worker_id)")
     print(f"{'='*65}\n")
 
     # ── Main process determinism ───────────────────────────────────────────────
-    # Workers are intentionally seeded differently (worker_id * 1000 + time)
-    # to ensure diverse self-play games. Only the main process (training
-    # steps, calibration, checkpointing) is fixed here.
+    if cfg.seed is None:
+        cfg.seed = random.randint(0, 2**31 - 1)
+        print(f"  Auto-selected seed: {cfg.seed}  (pass --seed {cfg.seed} to reproduce)")
+    else:
+        print(f"  Using fixed seed:   {cfg.seed}")
+
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
@@ -417,6 +619,21 @@ def main():
 
     net.eval()
 
+    # ── Elo evaluator ─────────────────────────────────────────────────────────
+    elo_evaluator = EloEvaluator(
+        start_elo = cfg.elo_start,
+        k_factor  = cfg.elo_k,
+        budget    = cfg.elo_budget,
+    ) if cfg.elo_interval > 0 else None
+
+    # If resuming, try to restore Elo from the last log entry
+    if cfg.resume and log and elo_evaluator:
+        last_elo_entries = [e for e in log if 'elo' in e]
+        if last_elo_entries:
+            elo_evaluator.current_elo = last_elo_entries[-1]['elo']
+            elo_evaluator.ref_elo     = last_elo_entries[-1]['elo']   # reset ref pair
+            print(f"  Restored Elo from checkpoint: {elo_evaluator.current_elo:.0f}")
+
     # Initial calibration
     print("  Running initial threshold calibration...")
     solver    = TacticalSolver()
@@ -454,7 +671,7 @@ def main():
     for wid in range(cfg.workers):
         p = ctx.Process(
             target=selfplay_worker,
-            args=(wid, weight_queues[wid], result_queue, config_dict, thresholds),
+            args=(wid, weight_queues[wid], result_queue, config_dict, thresholds, cfg.seed),
             daemon=True,
         )
         p.start()
@@ -546,6 +763,19 @@ def main():
               f"lr={scheduler.get_last_lr()[0]:.2e}  "
               f"time={train_time:.1f}s")
 
+        # ── Elo evaluation ────────────────────────────────────────────────────
+        elo_entry = {}
+        if elo_evaluator and cfg.elo_interval > 0 and iteration % cfg.elo_interval == 0:
+            elo_entry = elo_evaluator.evaluate(
+                net       = net,
+                iteration = iteration,
+                num_games = cfg.elo_games,
+                device    = device,
+            )
+        elif elo_evaluator and iteration == start_iter:
+            # Set initial reference silently on first iteration (no games played yet)
+            elo_evaluator.set_reference(net)
+
         # ── Recalibration ─────────────────────────────────────────────────────
         recalibrator.update_network(net)
         if recalibrator.should_recalibrate(iteration):
@@ -576,6 +806,12 @@ def main():
             'stop_rate':      recalibrator.history[-1].expected_stop_rate if recalibrator.history else None,
             'target_stop_rate': cfg.target_stop_rate,
             'iter_time':      round(time.time() - iter_start, 1),
+            # Elo fields — present only on evaluation iterations, else null
+            'elo':            elo_entry.get('elo',          None),
+            'elo_delta':      elo_entry.get('elo_delta',    None),
+            'elo_win_rate':   elo_entry.get('elo_win_rate', None),
+            'elo_games':      elo_entry.get('elo_games',    None),
+            'elo_ci_1sigma':  elo_entry.get('elo_ci_1sigma',None),
         }
         log.append(iter_log)
 
@@ -585,7 +821,8 @@ def main():
         if iteration % cfg.checkpoint_interval == 0 or iteration == cfg.iterations:
             ckpt_path = ckpt_dir / f'iter_{iteration:04d}.pt'
             save_checkpoint(str(ckpt_path), net, optimizer, iteration,
-                            cfg, thresholds, log)
+                            cfg, thresholds, log,
+                            elo_history=elo_evaluator.history if elo_evaluator else [])
             buffer.save(str(ckpt_dir / 'replay_buffer.pkl'))
             print(f"  ✓ Checkpoint saved: {ckpt_path}")
 

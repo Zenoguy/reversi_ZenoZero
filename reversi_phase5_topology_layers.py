@@ -36,6 +36,7 @@ from reversi_phase5_topology_core import (
     PatternHeuristic, CompactReversiNet,
     _nb_ucb_select   # ← import the kernel
 )
+from reversi_phase5_dynamic_threshold_recalibrator import MahalanobisEarlyStop
 
 # ── Training data record ──────────────────────────────────────────────────────
 
@@ -128,8 +129,23 @@ class LambdaController:
         """
         Layer 2 weight. High when tree is concentrated (low H_v), dominant
         move exists (high G), and evaluations agree (low Var_Q).
+
+        FIX #4 — normalization:
+          H_v  ∈ [0,1] by construction.
+          G    ∈ [0,1] by construction.
+          Var_Q ∈ [0,∞) — clamped to [0,1] here.  Typical midgame range is
+          [0, 0.05]; clamping at 1.0 gives very coarse resolution.  A tighter
+          empirical clamp at 0.1 (≈ 2σ of observed values) gives 10× finer
+          resolution over the range that actually matters.  This does not change
+          the formula's structure — it only fixes the effective input range so
+          the three terms are on comparable scales.
+
+        TODO Phase 5.5d: replace this formula entirely with a 3-input MLP
+          trained from TopologyLogger data.  Inputs: (H_v, G, Var_Q_norm).
+          Target: λ_optimal derived from win-outcome column.  The weights
+          (0.3, 0.3, 0.4) below are a placeholder until that data exists.
         """
-        var_term = min(Var_Q, 1.0)
+        var_term = min(Var_Q, 0.10) / 0.10   # FIX #4: normalize to [0,1] over empirical range
         lam = (
             0.3 * (1.0 - H_v) +
             0.3 * G +
@@ -169,19 +185,32 @@ class LambdaController:
 
 class DynamicExploration:
     """
-    c_puct = c₀ · (1 + λ_explore)
+    Gated exploration widening — Layer 5.
 
-    λ_explore = H_v · (1 - G) is computed by LambdaController.
-    High when tree is uncertain (high H_v) and no move dominates (low G).
-    Accepting λ_explore directly keeps Layer 5 decoupled from the raw signals.
+    Computes an unconstrained c_puct from λ_explore:
+        c_raw = c₀ · (1 + λ_explore)
+
+    But applies a metareasoning gate before use:
+        gate    = 1 - λ_heuristic          # L4's uncertainty
+        c_puct  = c₀ + gate · (c_raw - c₀)
+
+    Rationale (Russell & Wefald, rational metareasoning):
+      The value of additional exploration is proportional to decision uncertainty.
+      When L4 is confident (lam_h high → gate low), the best move is already
+      known — exploration has low VOC, L5 stays quiet.
+      When L4 is uncertain (lam_h low → gate high), exploration is valuable —
+      L5 fires at full strength.
+
+    This makes L5 cooperative with L4 rather than adversarial. Ablation
+    confirmed that without the gate, L5 interferes with L4's confident
+    decisions and degrades win rate from 70% to 50%.
     """
 
     def __init__(self, base_c: float = 1.414):
         self.base_c = base_c
 
     def compute_c_puct(self, lam_explore: float) -> float:
-        # Equivalent to old c₀·(1 + H_v·(1-G)) — now receives the
-        # already-computed λ_explore rather than raw H_v / G.
+        """Raw (ungated) c_puct — gate applied in TopologyAwareMCTS._c_from_lam_e."""
         return self.base_c * (1.0 + lam_explore)
 
 
@@ -197,22 +226,26 @@ class DifficultyAllocator:
     and is why compute savings mirrored the raw 400-vs-800 ratio.
 
     New logic: after a probe phase of PROBE_SIMS simulations, compute a
-    difficulty score D ∈ [0,1] from tree topology:
+    difficulty score D ∈ [0,1] from tree topology using a multiplicative formula:
 
-        D = 0.4 · H_v  +  0.4 · (1 − G)  +  0.2 · min(Var_Q, 1)
+        D = 0.7 · (H_v · (1−G))  +  0.3 · min(Var_Q, 1)
 
-    Intuition:
-      H_v high  → visits spread, position genuinely unclear → hard
-      G low     → no dominant move yet → hard
-      Var_Q high → children disagree on value → hard
+    H_v and G are anti-correlated by construction — high entropy means visits
+    are spread, high gap means one move dominates. The old linear sum
+    (0.4·H_v + 0.4·(1−G)) double-counted the same underlying signal.
+    The product H_v·(1−G) is high only when entropy is genuine AND no move
+    has pulled ahead — the true "contested position" signal.
+    Var_Q stays separate — it comes from the value distribution, not visit
+    counts, so it carries independent information.
 
-    Total budget is then:
-        budget = MIN_BUDGET + D · (MAX_BUDGET − MIN_BUDGET)
+    Budget is then mapped through a sigmoid (k=8, centred at D=0.5):
+        sig(D) = 1 / (1 + exp(-8·(D - 0.5)))
+        budget = MIN + sig(D) · (MAX − MIN)
 
     Default range [80, 900]:
-      D ≈ 0.0 → 80 sims   (forced / trivially clear)
-      D ≈ 0.5 → 490 sims  (typical midgame)
-      D ≈ 1.0 → 900 sims  (deeply contested)
+      D ≈ 0.0 → ~96 sims  (forced / trivially clear)
+      D ≈ 0.5 → 490 sims  (contested midgame)
+      D ≈ 1.0 → ~884 sims (deeply uncertain)
 
     Phase adjustment (applied after difficulty):
       Opening   (< 16 pieces): × 0.7 — less strategic complexity
@@ -377,6 +410,12 @@ class TopologyAwareMCTS:
 
     METRICS_INTERVAL = 50   # refresh topology signals every N simulations
 
+    # EMA smoothing coefficients — deliberately different for each channel.
+    # lam_h drives UCB selection every sim → slower smoothing (more stable).
+    # lam_e drives c_puct (exploration width) → faster response to tree changes.
+    EMA_ALPHA_H = 0.3   # weight on new raw value for lam_h  (0.7 on old)
+    EMA_ALPHA_E = 0.5   # weight on new raw value for lam_e  (0.5 on old)
+
     def __init__(
         self,
         network:          CompactReversiNet,
@@ -422,6 +461,11 @@ class TopologyAwareMCTS:
         self._h_v_thresh   = 0.15   # very low entropy  — visits nearly all on one move
         self._g_thresh     = 0.85   # huge dominance gap — top move has massive visit lead
         self._var_q_thresh = 0.01   # near-zero variance — children unanimously agree
+
+        # Mahalanobis early-stop model — replaces the rectangular box above
+        # once set_thresholds() is called with a fitted model from the calibrator.
+        # Falls back to the box thresholds if None (before first calibration).
+        self.mahal_stop: Optional[MahalanobisEarlyStop] = None
 
         # EMA smoothing state for λ — reset at the start of each search().
         # Prevents λ from thrashing between refresh() calls within one move.
@@ -486,6 +530,13 @@ class TopologyAwareMCTS:
 
         # ── Build root (reused for probe + main search) ───────────────────────
         root = MCTSNode(game_state=game.copy())
+        root.visit_count = 1   # FIX #5: treat the initial NN evaluation as the
+                               # root's own visit.  Without this, parent_visits=0
+                               # on the first selection step which breaks the UCB
+                               # sqrt term.  The old patch (root.visit_count += 1
+                               # inside _simulate) gave root a visit_count of
+                               # BUDGET+1 with value_sum=0, making root.value
+                               # meaningless.  Initialising here is clean and correct.
         local_simulations = 0   # per-search counter — does NOT accumulate across moves
 
         # ── Reset EMA smoothing state for this move ───────────────────────────
@@ -526,26 +577,31 @@ class TopologyAwareMCTS:
                 self._lam_h_smooth = self.lam_ctrl.compute_lambda_heuristic(
                     probe_m['visit_entropy'], probe_m['dominance_gap'], probe_m['value_variance']
                 )
-                self._lam_e_smooth = self.lam_ctrl.compute_lambda_explore(
-                    probe_m['visit_entropy'], probe_m['dominance_gap']
-                )
+                if self.dyn_explore is not None:
+                    self._lam_e_smooth = self.lam_ctrl.compute_lambda_explore(
+                        probe_m['visit_entropy'], probe_m['dominance_gap']
+                    )
             metrics = probe_m
         else:
-            budget    = 400
+            # FIX #3: fallback budget was 400, baseline is 800 — mismatch invalidated
+            # ablation comparisons.  Matched to PureMCTS.BUDGET so any win-rate
+            # difference reflects algorithmic quality, not compute advantage.
+            budget    = 800
             remaining = budget
             metrics   = self.tree_metrics.compute(root)
             if self.lam_ctrl:
                 self._lam_h_smooth = self.lam_ctrl.compute_lambda_heuristic(
                     metrics['visit_entropy'], metrics['dominance_gap'], metrics['value_variance']
                 )
-                self._lam_e_smooth = self.lam_ctrl.compute_lambda_explore(
-                    metrics['visit_entropy'], metrics['dominance_gap']
-                )
+                if self.dyn_explore is not None:
+                    self._lam_e_smooth = self.lam_ctrl.compute_lambda_explore(
+                        metrics['visit_entropy'], metrics['dominance_gap']
+                    )
             # probe_difficulty stays 0.5 if budget_ctrl is disabled
 
         cur_lam_h = self._lam_h_smooth
         cur_lam_e = self._lam_e_smooth
-        cur_c     = self._c_from_lam_e(cur_lam_e)
+        cur_c     = self._c_from_lam_e(cur_lam_e, cur_lam_h)
 
         # ── Refresh closure — updates all signals with EMA ────────────────────
         def refresh():
@@ -555,15 +611,19 @@ class TopologyAwareMCTS:
                 raw_h = self.lam_ctrl.compute_lambda_heuristic(
                     metrics['visit_entropy'], metrics['dominance_gap'], metrics['value_variance']
                 )
-                raw_e = self.lam_ctrl.compute_lambda_explore(
-                    metrics['visit_entropy'], metrics['dominance_gap']
-                )
-                # EMA: 0.7 weight on previous smooth value prevents within-search thrashing
-                self._lam_h_smooth = 0.7 * self._lam_h_smooth + 0.3 * raw_h
-                self._lam_e_smooth = 0.7 * self._lam_e_smooth + 0.3 * raw_e
+                # lam_h: slow EMA — drives UCB every sim, stability matters
+                self._lam_h_smooth = (1 - self.EMA_ALPHA_H) * self._lam_h_smooth + self.EMA_ALPHA_H * raw_h
+
+                if self.dyn_explore is not None:
+                    raw_e = self.lam_ctrl.compute_lambda_explore(
+                        metrics['visit_entropy'], metrics['dominance_gap']
+                    )
+                    # lam_e: faster EMA — exploration width should respond quicker
+                    self._lam_e_smooth = (1 - self.EMA_ALPHA_E) * self._lam_e_smooth + self.EMA_ALPHA_E * raw_e
+
             cur_lam_h = self._lam_h_smooth
             cur_lam_e = self._lam_e_smooth
-            cur_c     = self._c_from_lam_e(cur_lam_e)
+            cur_c     = self._c_from_lam_e(cur_lam_e, cur_lam_h)
 
         # ── Main simulation loop ──────────────────────────────────────────────
         for i in range(remaining):
@@ -604,9 +664,10 @@ class TopologyAwareMCTS:
             'simulations':       local_simulations,
             'total_simulations': self.total_simulations,
             'tactical':          False,
-            'lambda_h':          cur_lam_h,        # primary — backward compat
-            'lambda_explore':    cur_lam_e,
-            'difficulty':        probe_difficulty,  # replaces lambda_budget
+            'lambda_h':          cur_lam_h,
+            'lambda_explore':    cur_lam_e if self.dyn_explore is not None else 0.0,
+            'l5_gate':           float(1.0 - cur_lam_h) if self.dyn_explore is not None else 0.0,
+            'difficulty':        probe_difficulty,
             'H_v':               metrics['visit_entropy'],
             'G':                 metrics['dominance_gap'],
             'Var_Q':             metrics['value_variance'],
@@ -622,12 +683,22 @@ class TopologyAwareMCTS:
         """
         Override early-stop thresholds. Called by training loop after
         recalibration, or by benchmark to load from checkpoint.
-        The Strength-First defaults (0.15, 0.85, 0.01) are used if this
-        is never called — they are conservative enough to be safe standalone.
+
+        If t contains 'mahal_model_dict', reconstruct and install the
+        MahalanobisEarlyStop model — it becomes the primary authority for
+        _should_stop().  The box thresholds are updated too for fallback
+        and logging continuity.
         """
         self._h_v_thresh   = t['H_v_thresh']
         self._g_thresh     = t['G_thresh']
         self._var_q_thresh = t['Var_Q_thresh']
+
+        # Reconstruct Mahalanobis model if present
+        mahal_dict = t.get('mahal_model_dict')
+        if mahal_dict is not None:
+            self.mahal_stop = MahalanobisEarlyStop.from_dict(mahal_dict)
+        # If mahal_dict is None (old checkpoint or pre-calibration),
+        # self.mahal_stop stays None and _should_stop falls back to the box.
     # ── Simulation internals ──────────────────────────────────────────────────
 
     def _simulate(self, root: MCTSNode, prior: np.ndarray,
@@ -666,13 +737,16 @@ class TopologyAwareMCTS:
             n.visit_count += 1
             n.value_sum   += value
             value = -value   # flip perspective each level
-        root.visit_count += 1   # root must be counted or parent_visits=0 breaks UCB
+        # FIX #5: root is initialised with visit_count=1 in search() — no patch needed here.
     def _select(self, node: MCTSNode, lambda_h: float, c_puct: float) -> MCTSNode:
         """
         Layer 2: PUCT + λ·h_astar.
         λ is clamped to 0.6 max — prevents heuristic from fully dominating
         the UCB score even when the controller is confident.
         All scoring runs inside the @njit kernel — no Python loop over children.
+
+        FIX #1: priors passed to the kernel are prior * pruning_factor.
+        child.prior itself is never modified — the network trains on clean priors.
         """
         children = list(node.children.values())
         n        = len(children)
@@ -684,11 +758,11 @@ class TopologyAwareMCTS:
 
         for i, child in enumerate(children):
             q_values[i]     = child.value_sum / child.visit_count if child.visit_count else 0.0
-            priors[i]       = child.prior
+            # FIX #1: apply Layer-3 penalty on the fly — child.prior stays clean
+            priors[i]       = child.prior * child.pruning_factor
             visit_counts[i] = child.visit_count
             h_astars[i]     = child.h_astar
 
-        # Clamp: never let heuristic fully dominate the selection signal
         effective_lambda = min(lambda_h, 0.6)
 
         idx = _nb_ucb_select(
@@ -702,7 +776,21 @@ class TopologyAwareMCTS:
     def _expand(self, node: MCTSNode, prior: np.ndarray) -> MCTSNode:
         """
         Pop one untried move, create child, cache h_astar once.
-        Layer 3: apply soft pruning to prior if enabled.
+        Layer 3: soft pruning stored in child.pruning_factor — never mutates child.prior.
+
+        FIX #2 — h_astar sign convention:
+          heuristic.evaluate(board, child_game.current_player) returns a score
+          from the perspective of the player who is ABOUT TO MOVE (child's turn),
+          which is the OPPONENT of the player doing the selection at this node.
+          A positive score means the opponent is in a strong position — bad for us.
+          We must negate before storing so that h_astar > 0 means "this move is
+          good for the selecting player", consistent with how Q-values are signed.
+
+        FIX #1 — soft pruning isolation:
+          Layer-3 penalty is stored in child.pruning_factor (default 1.0).
+          _select() multiplies prior * pruning_factor on the fly inside the UCB
+          kernel.  child.prior is never modified — the training loop reads clean
+          visit counts; the network's own prior is never distorted by the heuristic.
         """
         move = node.untried_moves.pop(
             np.random.randint(len(node.untried_moves))
@@ -712,35 +800,72 @@ class TopologyAwareMCTS:
         child_game.make_move(move)
 
         child = MCTSNode(game_state=child_game, parent=node, move=move)
-        child.prior = prior[self.net.move_to_action(move)]
+        child.prior = prior[self.net.move_to_action(move)]  # stored clean — never touched again
 
-        # Compute and cache heuristic once
+        # FIX #2: negate because evaluate() uses child's player perspective (opponent).
+        # Good for opponent → bad for selecting player → should be negative h_astar.
         h_raw = self.heuristic.evaluate(
             child_game.board,
-            child_game.current_player,
+            child_game.current_player,   # opponent's turn after our move
         )
-        child.h_astar = float(np.clip(h_raw, -1.0, 1.0))
+        child.h_astar = float(np.clip(-h_raw, -1.0, 1.0))  # negated
 
-        # Layer 3: soft pruning — continuous penalty from h_astar
-        # Old: piecewise {0, 0.5, 1.0} → multipliers {1.0, 0.78, 0.61} (barely noticeable)
-        # New: continuous exp(-1.5 · max(0, -h)) → worst case h=-1 gives ×0.22
+        # FIX #1: Layer 3 soft pruning — write to pruning_factor, not prior.
+        # exp(-1.5·penalty) ∈ (0, 1] for penalty > 0 (h_astar < 0 before negation,
+        # i.e. original h_raw > 0 would have been opponent-favourable — but note
+        # after negation child.h_astar < 0 means move is heuristically bad for us).
         if self.use_pruning and child.h_astar < 0.0:
-            penalty = -child.h_astar   # in (0, 1] when h_astar < 0
-            child.prior *= np.exp(-1.5 * penalty)
+            penalty = -child.h_astar              # ∈ (0, 1]
+            child.pruning_factor = float(np.exp(-1.5 * penalty))
+        # else: child.pruning_factor stays at default 1.0 (no penalty)
 
         node.children[move] = child
         return child
 
     def _should_stop(self, m: Dict) -> bool:
-        return (m['visit_entropy']  < self._h_v_thresh   and
-                m['dominance_gap']  > self._g_thresh      and
-                m['value_variance'] < self._var_q_thresh)
+        """
+        Layer 6 early-stop decision.
 
-    def _c_from_lam_e(self, lam_e: float) -> float:
-        """Compute c_puct from the explore λ channel."""
+        Primary path  — MahalanobisEarlyStop fitted by calibrator:
+          Evaluates a quadratic form in covariance-normalised (H_v, G, Var_Q)
+          space.  Decision boundary is an ellipsoid that tracks the joint
+          distribution as the network trains — self-normalizing, no manual
+          threshold tuning needed.
+
+        Fallback path — rectangular box (before first calibration or if
+          mahal_stop is None):
+          The original three independent thresholds.  Conservative by design.
+        """
+        H_v   = m['visit_entropy']
+        G     = m['dominance_gap']
+        Var_Q = m['value_variance']
+
+        if self.mahal_stop is not None:
+            return self.mahal_stop.should_stop(H_v, G, Var_Q)
+
+        # Fallback rectangular box
+        return (H_v   < self._h_v_thresh   and
+                G     > self._g_thresh      and
+                Var_Q < self._var_q_thresh)
+
+    def _c_from_lam_e(self, lam_e: float, lam_h: float = 0.5) -> float:
+        """
+        Compute c_puct with metareasoning-gated L5.
+
+        Gate = (1 - lam_h): L4's uncertainty about the best move.
+          - lam_h high (L4 confident) → gate low → L5 barely fires
+          - lam_h low  (L4 uncertain) → gate high → L5 fires at full strength
+
+        This makes L5 cooperative with L4: exploration widening is applied
+        proportionally to the value of that exploration (Russell & Wefald VOC).
+        Without the gate, L5 fires on confident positions and degrades WR 70→50%.
+        """
         if self.dyn_explore is None:
             return 1.414
-        return self.dyn_explore.compute_c_puct(lam_e)
+        base_c   = self.dyn_explore.base_c
+        raw_c    = self.dyn_explore.compute_c_puct(lam_e)   # ungated
+        gate     = 1.0 - lam_h                              # ∈ [0,1], high when L4 uncertain
+        return base_c + gate * (raw_c - base_c)
 
     def _make_record(self, game: ReversiGame, player: int,
                      policy: np.ndarray) -> SelfPlayRecord:

@@ -295,8 +295,14 @@ class MCTSNode:
     value_sum:   float = 0.0
     children: dict     = None
     untried_moves: list = None
-    prior:   float = 1.0
-    h_astar: float = 0.0   # cached at expansion — read in _nb_ucb_select
+    prior:          float = 1.0
+    h_astar:        float = 0.0   # cached at expansion — read in _nb_ucb_select
+    pruning_factor: float = 1.0   # FIX #1: Layer-3 soft-pruning weight stored HERE,
+                                  # never applied to prior in-place.  UCB selection
+                                  # multiplies prior * pruning_factor on the fly so
+                                  # child.prior stays clean for policy-target computation
+                                  # and the network never trains on heuristic-distorted
+                                  # visit distributions.
 
     def __post_init__(self):
         if self.children is None:
@@ -421,7 +427,12 @@ class CompactReversiNet(nn.Module):
         self.board_size = board_size
         S = board_size
 
-        self.conv1 = nn.Conv2d(4, channels, 3, padding=1); self.bn1 = nn.BatchNorm2d(channels)
+        # FIX #6: residual (skip-connection) conv blocks for better gradient flow.
+        # Block 1 has a 1×1 projection because input channels (4) ≠ hidden channels.
+        # Blocks 2-4 are plain residuals (same channel width throughout).
+        self.conv1 = nn.Conv2d(4,        channels, 3, padding=1); self.bn1 = nn.BatchNorm2d(channels)
+        self.proj1 = nn.Conv2d(4,        channels, 1, bias=False) # projection for skip
+
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1); self.bn2 = nn.BatchNorm2d(channels)
         self.conv3 = nn.Conv2d(channels, channels, 3, padding=1); self.bn3 = nn.BatchNorm2d(channels)
         self.conv4 = nn.Conv2d(channels, channels, 3, padding=1); self.bn4 = nn.BatchNorm2d(channels)
@@ -429,15 +440,19 @@ class CompactReversiNet(nn.Module):
         self.p_conv = nn.Conv2d(channels, 2, 1); self.p_bn = nn.BatchNorm2d(2)
         self.p_fc   = nn.Linear(2 * S * S, self.NUM_ACTIONS)
 
+        # FIX #6 (value head): widen the value bottleneck from 64 → 128 units.
+        # 64 was too tight for complex midgame value estimation.
         self.v_conv = nn.Conv2d(channels, 1, 1); self.v_bn = nn.BatchNorm2d(1)
-        self.v_fc1  = nn.Linear(S * S, 64)
-        self.v_fc2  = nn.Linear(64, 1)
+        self.v_fc1  = nn.Linear(S * S, 128)
+        self.v_fc2  = nn.Linear(128, 1)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
-        x = F.relu(self.bn4(self.conv4(x)))
+        # Block 1 — projected residual (4 → channels)
+        x = F.relu(self.bn1(self.conv1(x)) + self.proj1(x))
+        # Blocks 2-4 — plain residuals (channels → channels)
+        x = F.relu(self.bn2(self.conv2(x)) + x)
+        x = F.relu(self.bn3(self.conv3(x)) + x)
+        x = F.relu(self.bn4(self.conv4(x)) + x)
 
         p = F.relu(self.p_bn(self.p_conv(x)))
         p = p.view(p.size(0), -1)

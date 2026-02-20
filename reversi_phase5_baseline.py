@@ -114,6 +114,7 @@ class PureMCTS:
 
         # ── MCTS ──────────────────────────────────────────────────────────────
         root = MCTSNode(game_state=game.copy())
+        root.visit_count  = 1   # FIX #5: see topology_layers.py for rationale
         local_simulations = 0
 
         for _ in range(self.BUDGET):
@@ -181,7 +182,7 @@ class PureMCTS:
             n.visit_count += 1
             n.value_sum   += value
             value = -value
-        root.visit_count += 1   # same fix as topology system
+        # FIX #5: root initialised with visit_count=1 in search() — no patch needed.
 
 
     def _select(self, node: MCTSNode) -> MCTSNode:

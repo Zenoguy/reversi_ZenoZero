@@ -57,7 +57,7 @@ import numpy as np
 import json
 import time
 from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
 import torch
@@ -68,6 +68,161 @@ from reversi_phase5_topology_core import (
     TacticalSolver, PatternHeuristic, CompactReversiNet,
     _nb_ucb_select
 )
+
+
+# ── Mahalanobis early-stop model ──────────────────────────────────────────────
+
+class MahalanobisEarlyStop:
+    """
+    Replaces three independent fixed thresholds with a single nonlinear
+    decision surface — a covariance-aware ellipsoid in (H_v, G, Var_Q) space.
+
+    Why this is better than the rectangular box:
+      H_v and G are anti-correlated by construction (high entropy ↔ low gap).
+      The old box checked each signal independently, creating false positives
+      when one was extreme but the other wasn't. The ellipsoid captures their
+      joint geometry — the decision boundary is tilted in the H_v×G plane via
+      the off-diagonal entries of the precision matrix Σ⁻¹.
+
+      Var_Q's 80× jump after the first training step (0.0007 → 0.056) made the
+      fixed threshold Var_Q < 0.01 permanently inert. Mahalanobis normalises
+      each dimension by its own variance — a post-training Var_Q of 0.05 is
+      only ~1σ from the new mean, not 50× over threshold.
+
+    The single parameter k is expressed in standard-deviation units of the
+    probe distribution — k=2.5 means "stop only when the position is 2.5σ
+    from the mean in the resolved direction." This is self-normalizing across
+    training iterations and across domains.
+
+    Score function:  d = √(δᵀ Σ⁻¹ δ)   where δ = x - μ
+    This is a quadratic form — a curved (nonlinear) decision surface, not
+    three linear inequalities.
+    """
+
+    def __init__(self, k: float = 1.0):
+        """
+        k : Mahalanobis distance threshold in σ-units.
+
+        Calibration guide (from post-training distribution probe):
+          k=0.8  → ~15% stop rate   (aggressive compute savings)
+          k=1.0  → ~13% stop rate   (recommended default — good balance)
+          k=1.2  → ~11% stop rate   (conservative)
+          k=1.5  →  ~6% stop rate   (very conservative)
+          k=2.0  →  ~1% stop rate   (near-never fires)
+          k=2.5  →   0% stop rate   (never fires — useless)
+
+        Note: k=2.5 was the initial default but never fired on real post-training
+        data because genuinely resolved positions are typically only 1-2σ from the
+        distribution mean (the distribution is already skewed toward clear positions
+        since contested positions tend to be resolved by the search budget).
+        """
+        self.k        = k
+        self.mean_vec: Optional[np.ndarray] = None   # shape (3,): [μ_Hv, μ_G, μ_VQ]
+        self.cov_inv:  Optional[np.ndarray] = None   # shape (3,3): precision matrix Σ⁻¹
+        self._ready   = False
+
+    # ── Fitting ───────────────────────────────────────────────────────────────
+
+    def fit(self, h_vs: List[float], gs: List[float], var_qs: List[float]):
+        """
+        Fit from calibration probe data — called once per recalibration.
+        Computes μ and Σ⁻¹ from the joint distribution of (H_v, G, Var_Q).
+
+        Regularisation: add ε·I to Σ before inversion to handle near-zero
+        variance in any dimension (e.g. Var_Q on an untrained network).
+        """
+        X = np.column_stack([
+            np.array(h_vs,   dtype=np.float64),
+            np.array(gs,     dtype=np.float64),
+            np.array(var_qs, dtype=np.float64),
+        ])                                             # shape (n, 3)
+
+        self.mean_vec = X.mean(axis=0)
+        cov           = np.cov(X.T)                   # shape (3, 3)
+
+        # Regularise: prevents singular matrix when any signal has near-zero
+        # variance (common for Var_Q on random/early networks).
+        cov += np.eye(3) * 1e-6
+
+        self.cov_inv = np.linalg.inv(cov)
+        self._ready  = True
+
+    # ── Decision ──────────────────────────────────────────────────────────────
+
+    def should_stop(self, H_v: float, G: float, Var_Q: float) -> bool:
+        """
+        Return True iff the position is in the "clearly decided" ellipsoidal
+        region — i.e. at least k standard deviations from the mean in the
+        resolved direction.
+
+        "Resolved direction" requires ALL three conditions simultaneously:
+          H_v   below mean  → visits concentrated
+          G     above mean  → one move dominates
+          Var_Q below mean  → value estimates agree
+
+        This mirrors the conjunction of the old thresholds but uses the
+        joint covariance to weight their relative importance adaptively.
+        """
+        if not self._ready:
+            # Conservative fallback before first calibration
+            return (H_v < 0.15 and G > 0.85 and Var_Q < 0.01)
+
+        x     = np.array([H_v, G, Var_Q], dtype=np.float64)
+        delta = x - self.mean_vec
+
+        # Check directionality FIRST — cheap, avoids unnecessary matmul
+        # All three must deviate in the "resolved" direction
+        if not (H_v   < self.mean_vec[0] and    # entropy below mean
+                G     > self.mean_vec[1] and    # dominance above mean
+                Var_Q < self.mean_vec[2]):      # variance below mean
+            return False
+
+        # Mahalanobis distance — quadratic form in covariance-normalised space
+        d2 = float(delta @ self.cov_inv @ delta)
+        return np.sqrt(max(d2, 0.0)) >= self.k
+
+    def expected_stop_rate(
+        self, h_vs: List[float], gs: List[float], var_qs: List[float]
+    ) -> float:
+        """Fraction of probe positions that would trigger early stop."""
+        if not self._ready:
+            return 0.0
+        stops = sum(
+            1 for hv, g, vq in zip(h_vs, gs, var_qs)
+            if self.should_stop(hv, g, vq)
+        )
+        return stops / len(h_vs) if h_vs else 0.0
+
+    # ── Serialisation ─────────────────────────────────────────────────────────
+
+    def to_dict(self) -> Dict:
+        """Serialise to JSON-compatible dict for checkpoint saving."""
+        if not self._ready:
+            return {'ready': False, 'k': self.k}
+        return {
+            'ready':    True,
+            'k':        self.k,
+            'mean_vec': self.mean_vec.tolist(),
+            'cov_inv':  self.cov_inv.tolist(),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> 'MahalanobisEarlyStop':
+        """Deserialise from checkpoint dict."""
+        obj = cls(k=d.get('k', 2.5))
+        if d.get('ready', False):
+            obj.mean_vec = np.array(d['mean_vec'], dtype=np.float64)
+            obj.cov_inv  = np.array(d['cov_inv'],  dtype=np.float64)
+            obj._ready   = True
+        return obj
+
+    def __repr__(self) -> str:
+        if not self._ready:
+            return f"MahalanobisEarlyStop(k={self.k}, not fitted)"
+        return (f"MahalanobisEarlyStop(k={self.k}, "
+                f"μ=[{self.mean_vec[0]:.3f},{self.mean_vec[1]:.3f},"
+                f"{self.mean_vec[2]:.4f}])")
+
 
 # ── Calibration result dataclass ──────────────────────────────────────────────
 
@@ -98,6 +253,7 @@ class CalibrationResult:
     timestamp:        float
     training_iteration: int = 0
     expected_stop_rate: float = 0.0   # fraction of positions that would early-stop
+    mahal_model_dict:   Optional[dict] = None  # serialised MahalanobisEarlyStop
 
 
 # ── Core calibrator ───────────────────────────────────────────────────────────
@@ -257,6 +413,7 @@ class ThresholdCalibrator:
     ) -> Optional[Dict[str, float]]:
         """Run probe_budget simulations and return tree metrics."""
         root = MCTSNode(game_state=game.copy())
+        root.visit_count = 1   # Fix #5: match topology_layers.py — prevents UCB sqrt(0) on first select
 
         for _ in range(self.probe_budget):
             self._simulate(root, prior)
@@ -360,38 +517,40 @@ class ThresholdCalibrator:
         var_qs: List[float],
         num_positions: int,
         training_iteration: int,
-        target_stop_rate: float = 0.25,   # kept for API compat, no longer used to set thresholds
+        target_stop_rate: float = 0.25,   # kept for API compat, informational only
+        mahal_k: float = 1.0,
     ) -> CalibrationResult:
         """
-        Strength-First Rule: thresholds are fixed conservative constants,
-        not derived from percentiles of the probed distribution.
+        Fit a MahalanobisEarlyStop model from the probe distribution and
+        package it alongside distribution statistics into a CalibrationResult.
 
-        The old percentile approach targeted a stop *rate* (25%) — meaning as
-        the model got stronger and all positions looked clearer, thresholds
-        tightened to maintain 25%, potentially stopping contested positions.
-        That optimises for frequency, not correctness.
+        The old rectangular thresholds (H_v<0.15, G>0.85, Var_Q<0.01) are
+        retained in the result for backward-compat logging but the Mahalanobis
+        model is the primary authority for _should_stop().
 
-        Fixed thresholds ensure early stop only fires when the position is
-        genuinely unambiguous on ALL three signals simultaneously:
-          H_v < 0.15  — visits almost entirely on one move
-          G   > 0.85  — top move has massive advantage over second
-          Var_Q < 0.01 — children unanimously agree on value
-
-        Distribution stats are still computed for drift detection and logging.
-        The actual stop rate at these thresholds is reported for observability.
+        The key insight from the training logs:
+          Var_Q jumped 80× after the first training step (0.0007 → 0.056),
+          making the fixed Var_Q<0.01 permanently inert and stop rate
+          collapsing from 91% to 4-9%.  Mahalanobis normalises by the
+          empirical covariance, so the decision surface automatically adapts
+          as the network trains — no manual threshold tuning required.
         """
-        h = np.array(h_vs)
-        g = np.array(gs)
-        v = np.array(var_qs)
+        h = np.array(h_vs,   dtype=np.float64)
+        g = np.array(gs,     dtype=np.float64)
+        v = np.array(var_qs, dtype=np.float64)
 
-        # Fixed conservative thresholds — the primary authority
+        # ── Fit Mahalanobis model ──────────────────────────────────────────
+        mahal = MahalanobisEarlyStop(k=mahal_k)
+        mahal.fit(h_vs, gs, var_qs)
+        mahal_stop_rate = mahal.expected_stop_rate(h_vs, gs, var_qs)
+
+        # ── Legacy rectangular thresholds (kept for compat + logging) ──────
+        # These are no longer used by _should_stop() — Mahalanobis takes over.
         H_v_thresh   = 0.15
         G_thresh     = 0.85
         Var_Q_thresh = 0.01
-
-        # Actual stop rate at these thresholds (observability only — not a target)
-        stop_mask = (h < H_v_thresh) & (g > G_thresh) & (v < Var_Q_thresh)
-        stop_rate = float(stop_mask.mean())
+        box_stop_mask = (h < H_v_thresh) & (g > G_thresh) & (v < Var_Q_thresh)
+        box_stop_rate = float(box_stop_mask.mean())
 
         return CalibrationResult(
             H_v_thresh   = H_v_thresh,
@@ -413,19 +572,35 @@ class ThresholdCalibrator:
             probe_budget       = 0,   # set by caller
             timestamp          = time.time(),
             training_iteration = training_iteration,
-            expected_stop_rate = stop_rate,
+            expected_stop_rate = mahal_stop_rate,   # now reports Mahalanobis rate
+            mahal_model_dict   = mahal.to_dict(),
         )
 
     @staticmethod
     def _print_result(r: CalibrationResult, elapsed: float = 0.0):
         print(f"\n{'─'*65}")
-        print(f"  THRESHOLDS (Strength-First — fixed conservative constants):")
-        print(f"    H_v   < {r.H_v_thresh:.4f}   (entropy — position median {r.H_v_p50:.4f})")
-        print(f"    G     > {r.G_thresh:.4f}   (gap     — position median {r.G_p50:.4f})")
-        print(f"    Var_Q < {r.Var_Q_thresh:.4f}   (variance — position median {r.Var_Q_p50:.4f})")
+
+        # Mahalanobis model summary
+        if r.mahal_model_dict and r.mahal_model_dict.get('ready'):
+            mv = r.mahal_model_dict['mean_vec']
+            print(f"  MAHALANOBIS EARLY-STOP (primary):")
+            print(f"    k = {r.mahal_model_dict['k']:.2f} σ   "
+                  f"(stop when {r.mahal_model_dict['k']:.2f}σ from mean in resolved direction)")
+            print(f"    Distribution centre:  "
+                  f"H_v={mv[0]:.4f}  G={mv[1]:.4f}  Var_Q={mv[2]:.4f}")
+        else:
+            print(f"  MAHALANOBIS EARLY-STOP: not yet fitted (fallback to fixed thresholds)")
+
         print(f"\n  ACTUAL EARLY-STOP RATE: {r.expected_stop_rate*100:.1f}%  "
-              f"(informational — not a target)")
-        print(f"\n  DISTRIBUTIONS (used for drift detection):")
+              f"(Mahalanobis k={r.mahal_model_dict['k'] if r.mahal_model_dict else '—'})")
+
+        # Legacy box thresholds — kept for reference
+        print(f"\n  LEGACY THRESHOLDS (reference only — not used by _should_stop):")
+        print(f"    H_v   < {r.H_v_thresh:.4f}   (median {r.H_v_p50:.4f})")
+        print(f"    G     > {r.G_thresh:.4f}   (median {r.G_p50:.4f})")
+        print(f"    Var_Q < {r.Var_Q_thresh:.4f}   (median {r.Var_Q_p50:.4f})")
+
+        print(f"\n  DISTRIBUTIONS (for drift detection):")
         print(f"    H_v   {r.H_v_p25:.3f} / {r.H_v_p50:.3f} / {r.H_v_p75:.3f}  "
               f"(p25/p50/p75)  std={r.H_v_std:.3f}")
         print(f"    G     {r.G_p25:.3f} / {r.G_p50:.3f} / {r.G_p75:.3f}  "
@@ -472,7 +647,9 @@ class DynamicRecalibrator:
         pattern_heuristic: PatternHeuristic,
         probe_budget:      int   = 200,
         recal_interval:    int   = 5,
-        drift_threshold:   float = 0.10,
+        drift_threshold:   float = 2.0,   # σ-units — was 0.10 which fired every iteration
+                                          # 2.0 means "mean shifted by 2 std-devs" which
+                                          # is a genuine distribution shift, not just noise
         num_positions:     int   = 300,
         target_stop_rate:  float = 0.25,
         save_dir:          str   = 'calibrations',
@@ -607,11 +784,16 @@ class DynamicRecalibrator:
 
     @staticmethod
     def _to_dict(r: CalibrationResult) -> Dict:
-        """Return just the threshold keys — what mcts.set_thresholds() needs."""
+        """
+        Return threshold dict for mcts.set_thresholds().
+        Includes the serialised Mahalanobis model so MCTS can reconstruct it.
+        Legacy box thresholds included for fallback and logging.
+        """
         return {
-            'H_v_thresh':   r.H_v_thresh,
-            'G_thresh':     r.G_thresh,
-            'Var_Q_thresh': r.Var_Q_thresh,
+            'H_v_thresh':      r.H_v_thresh,
+            'G_thresh':        r.G_thresh,
+            'Var_Q_thresh':    r.Var_Q_thresh,
+            'mahal_model_dict': r.mahal_model_dict,   # MahalanobisEarlyStop serialised
         }
 
     def _save(self, r: CalibrationResult):
@@ -652,9 +834,10 @@ class DynamicRecalibrator:
         with open(p) as f:
             data = json.load(f)
         return {
-            'H_v_thresh':   data['H_v_thresh'],
-            'G_thresh':     data['G_thresh'],
-            'Var_Q_thresh': data['Var_Q_thresh'],
+            'H_v_thresh':       data['H_v_thresh'],
+            'G_thresh':         data['G_thresh'],
+            'Var_Q_thresh':     data['Var_Q_thresh'],
+            'mahal_model_dict': data.get('mahal_model_dict'),  # None on old checkpoints
         }
 
 
