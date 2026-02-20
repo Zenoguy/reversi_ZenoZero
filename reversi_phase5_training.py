@@ -125,6 +125,19 @@ def get_config() -> argparse.Namespace:
                         '(recommended for training diversity). Workers use master_seed + worker_id '
                         'so runs are reproducible if seed is specified.')
 
+    # Policy head surgery
+    p.add_argument('--reinit-policy-head',  action='store_true',
+                   help='Reinitialise p_fc (the Linear(128,65) output layer of the policy head) '
+                        'after resuming. Use when policy loss has plateaued due to contaminated '
+                        'training targets. Keeps p_conv/p_bn (spatial feature extractor) intact — '
+                        'only the final layer that directly fitted to distorted visit distributions '
+                        'is reset. Combine with --policy-loss-weight 1.5 for the first run.')
+    p.add_argument('--policy-loss-weight',  type=float, default=1.0,
+                   help='Multiplier on policy cross-entropy loss. Default 1.0 (standard AlphaZero). '
+                        'Set 1.5 for ~10 iterations after --reinit-policy-head to give the fresh '
+                        'layer stronger gradient signal relative to the value head. Return to 1.0 '
+                        'once policy loss resumes dropping (usually within 5 iterations).')
+
     return p.parse_args()
 
 
@@ -289,16 +302,61 @@ def _play_game(
     return records
 
 
+# ── Policy head surgery ───────────────────────────────────────────────────────
+
+def reinit_policy_head(net: CompactReversiNet):
+    """
+    Reinitialise only p_fc — the Linear(128, 65) layer that maps spatial
+    features directly to move probabilities.
+
+    Why only p_fc and not the whole policy head:
+      p_conv + p_bn learned *which spatial features predict good moves*.
+      That knowledge is board-geometry specific and genuinely trained — keeping
+      it means the fresh p_fc starts from meaningful inputs rather than noise.
+
+      p_fc is the layer that directly fitted to visit distributions. If those
+      distributions were contaminated (e.g. by soft-pruning distortion in the
+      pre-Fix #1 code), p_fc absorbs the bias as ground truth and stalls in a
+      local minimum. Policy loss plateauing at ~1.19 by iter 8 and not moving
+      for 92 iterations is the signature of this. Reinitialising p_fc breaks
+      out of that minimum while preserving the spatial feature extractor.
+
+    Initialisation:
+      Kaiming uniform — standard for layers preceding softmax.
+      Bias initialised to zero — no prior preference for any move.
+
+    After calling this, use --policy-loss-weight 1.5 for ~10 iterations to
+    give the fresh layer stronger gradient signal. Then return to 1.0.
+    """
+    with torch.no_grad():
+        nn.init.kaiming_uniform_(net.p_fc.weight, nonlinearity='linear')
+        nn.init.zeros_(net.p_fc.bias)
+
+    total_params = net.p_fc.weight.numel() + net.p_fc.bias.numel()
+    print(f"\n  ── Policy head surgery ──────────────────────────────────────")
+    print(f"  Reinitialised: p_fc  Linear(128, 65)  [{total_params:,} params]")
+    print(f"  Kept intact:   p_conv Conv2d(128→2, 1×1)  p_bn BatchNorm2d(2)")
+    print(f"  Expected:      policy_loss will spike then drop faster than before")
+    print(f"  ────────────────────────────────────────────────────────────\n")
+
+
 # ── Training step ─────────────────────────────────────────────────────────────
 
 def train_step(
-    net:       CompactReversiNet,
-    optimizer: optim.Optimizer,
-    loader:    DataLoader,
-    device:    torch.device,
-    num_steps: int,
+    net:           CompactReversiNet,
+    optimizer:     optim.Optimizer,
+    loader:        DataLoader,
+    device:        torch.device,
+    num_steps:     int,
+    policy_weight: float = 1.0,
 ) -> Dict[str, float]:
-    """Run num_steps gradient updates. Returns loss stats."""
+    """Run num_steps gradient updates. Returns loss stats.
+
+    policy_weight: multiplier on the policy cross-entropy term.
+      1.0 = standard AlphaZero (default).
+      1.5 = boosted — use for ~10 iters after --reinit-policy-head to give
+            the fresh p_fc layer stronger gradient signal vs the value head.
+    """
     net.train()
     policy_losses = []
     value_losses  = []
@@ -323,7 +381,8 @@ def train_step(
             # prevents value head from dominating gradient when policy is noisy
             value_loss   = nn.functional.mse_loss(value_pred, value_targets)
 
-            loss = policy_loss + 0.5 * value_loss
+            # policy_weight > 1.0 boosts policy gradient signal after reinit
+            loss = policy_weight * policy_loss + 0.5 * value_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -571,6 +630,8 @@ def main():
     print(f"  Batch size:     {cfg.batch_size}")
     print(f"  LR:             {cfg.lr}")
     print(f"  Target stop %%:  {cfg.target_stop_rate*100:.0f}%%")
+    print(f"  Policy weight:  {cfg.policy_loss_weight}{'  ← boosted (reinit mode)' if cfg.policy_loss_weight != 1.0 else ''}")
+    print(f"  Reinit p_fc:    {cfg.reinit_policy_head}")
     print(f"  Seed:           {'auto' if cfg.seed is None else cfg.seed}  (workers: master_seed + worker_id)")
     print(f"{'='*65}\n")
 
@@ -618,6 +679,14 @@ def main():
             print(f"  Loaded replay buffer: {len(buffer):,} positions")
 
     net.eval()
+
+    # ── Optional policy head surgery ──────────────────────────────────────────
+    if cfg.reinit_policy_head:
+        if not cfg.resume:
+            print("  ⚠  --reinit-policy-head has no effect without --resume "
+                  "(network is already randomly initialised)")
+        else:
+            reinit_policy_head(net)
 
     # ── Elo evaluator ─────────────────────────────────────────────────────────
     elo_evaluator = EloEvaluator(
@@ -751,7 +820,8 @@ def main():
             effective_steps = min(cfg.train_steps + len(buffer)//5000, cfg.train_steps*2)
 
         train_start = time.time()
-        losses = train_step(net, optimizer, loader, device, effective_steps)
+        losses = train_step(net, optimizer, loader, device, effective_steps,
+                            policy_weight=cfg.policy_loss_weight)
 
         scheduler.step()
         train_time = time.time() - train_start
@@ -805,6 +875,7 @@ def main():
             'Var_Q_thresh':   thresholds['Var_Q_thresh'],
             'stop_rate':      recalibrator.history[-1].expected_stop_rate if recalibrator.history else None,
             'target_stop_rate': cfg.target_stop_rate,
+            'policy_loss_weight': cfg.policy_loss_weight,
             'iter_time':      round(time.time() - iter_start, 1),
             # Elo fields — present only on evaluation iterations, else null
             'elo':            elo_entry.get('elo',          None),
