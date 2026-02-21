@@ -1,0 +1,1056 @@
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+"""
+REVERSI PHASE 5 — BENCHMARKING SCRIPT
+
+Compares TopologyAwareMCTS against PureMCTS (fixed 800 budget baseline)
+and measures:
+
+  1. Win / draw / loss rates
+  2. Average simulations per move (compute cost)
+  3. Average game length
+  4. Tactical hit rate (instant moves that bypass MCTS)
+  5. Per-layer contribution (ablation matrix)
+  6. Statistical significance (binomial test)
+
+Match format:
+  - N games per matchup
+  - Players swap colours every game to remove first-mover bias
+  - Results reported from Topology system's perspective
+
+Usage:
+  python3 reversi_phase5_benchmark.py --checkpoint checkpoints/iter_050.pt
+  python3 reversi_phase5_benchmark.py --checkpoint checkpoints/iter_050.pt --games 200
+  python3 reversi_phase5_benchmark.py --checkpoint checkpoints/iter_050.pt --ablation
+"""
+
+import argparse
+import time
+import json
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass, asdict
+import multiprocessing as mp
+
+import numpy as np
+import torch
+from scipy import stats as scipy_stats
+
+from reversi_phase5_topology_core import (
+    ReversiGame, TacticalSolver, PatternHeuristic, CompactReversiNet
+)
+from reversi_phase5_topology_layers import TopologyAwareMCTS
+from reversi_phase5_baseline import PureMCTS
+
+# ── Progress reporting ────────────────────────────────────────────────────────
+
+def _progress(label: str, done: int, total: int, results: list, t0: float):
+    """Print a one-line progress update. Called every PRINT_EVERY games."""
+    wins  = sum(r.topology_win  for r in results)
+    draws = sum(r.topology_draw for r in results)
+    losses = done - wins - draws
+    wr     = wins / done if done else 0.0
+    elapsed = time.time() - t0
+    pct    = done / total * 100
+    print(f"  [{label}]  {done:>4}/{total}  ({pct:>5.1f}%)  "
+          f"W={wins} D={draws} L={losses}  WR={wr:.1%}  "
+          f"[{elapsed:.0f}s]", flush=True)
+
+PRINT_EVERY = 10   # print a line every N completed games
+
+def get_config() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument('--checkpoint',  type=str,  default=None,
+                   help='Path to trained checkpoint. None = random weights.')
+    p.add_argument('--games',       type=int,  default=100,
+                   help='Games per matchup')
+    p.add_argument('--workers',     type=int,  default=None,
+                   help='Parallel game workers. Default: cpu_count()//2 - 1')
+    p.add_argument('--ablation',    action='store_true',
+                   help='Run full layer ablation matrix')
+    p.add_argument('--temperature', type=float, default=0.0,
+                   help='MCTS temperature for move selection (0=greedy)')
+    p.add_argument('--baseline-budget', type=int, default=800)
+    p.add_argument('--min-budget',  type=int,  default=80,
+                   help='DifficultyAllocator min sims — easy/forced positions')
+    p.add_argument('--max-budget',  type=int,  default=900,
+                   help='DifficultyAllocator max sims — deeply contested positions')
+    p.add_argument('--output',      type=str,  default='benchmark_results.json')
+    p.add_argument('--parallel-games',  action='store_true',
+                   help='Run benchmark games in parallel (cpu_count//2-1 workers)')
+    p.add_argument('--baseline-vs-baseline', action='store_true',
+                   help='Also run fixed-800 vs fixed-N to isolate compute effect')
+    p.add_argument('--compute-control-budget', type=int, default=400,
+                   help='Budget for baseline-vs-baseline compute control run')
+    p.add_argument('--seed',         type=int,  default=42,
+                   help='Global random seed for reproducibility')
+    p.add_argument('--seeds',        type=str,  default=None,
+                   help='Comma-separated seeds for multi-seed ablation, e.g. "42,1,7". '
+                        'Overrides --seed when ablation is enabled. '
+                        'Each seed runs the full ablation suite independently; '
+                        'results are aggregated and a summary table is printed.')
+    return p.parse_args()
+
+
+# ── Game result ───────────────────────────────────────────────────────────────
+
+@dataclass
+class GameResult:
+    winner:              Optional[int]   # 1=Black, -1=White, 0=Draw
+    topology_player:     int             # which colour topology played (1 or -1)
+    topology_win:        bool
+    topology_draw:       bool
+    game_length:         int
+    topology_sims:       int             # total simulations used by topology system
+    baseline_sims:       int
+    topology_tactical:   int             # tactical (instant) moves by topology
+    baseline_tactical:   int
+    topology_avg_lambda: float
+    topology_avg_H_v:    float
+    avg_kl_divergence: float
+
+
+@dataclass
+class MatchupResult:
+    name:          str
+    games:         int
+    wins:          int
+    draws:         int
+    losses:        int
+    win_rate:      float
+    draw_rate:     float
+    loss_rate:     float
+    avg_sims_topology:  float
+    avg_sims_baseline:  float
+    sim_savings_pct:    float   # (baseline - topology) / baseline * 100
+    avg_game_length:    float
+    avg_tactical_rate:  float   # fraction of topology moves that were tactical
+    avg_lambda:         float
+    avg_H_v:            float
+    p_value:            float   # binomial test vs 50% win rate
+    significant:        bool    # p < 0.05
+    avg_kl_divergence: float
+
+
+# ── Single game ───────────────────────────────────────────────────────────────
+
+def play_game(
+    topology_mcts: TopologyAwareMCTS,
+    baseline_mcts: PureMCTS,
+    topology_is_black: bool,
+    temperature: float,
+) -> GameResult:
+    """
+    Play one game. topology_mcts plays Black if topology_is_black, else White.
+    Returns GameResult from topology system's perspective.
+    """
+    game = ReversiGame()
+
+    topology_player = 1 if topology_is_black else -1
+    topology_sims   = 0
+    baseline_sims   = 0
+    topology_tactic = 0
+    baseline_tactic = 0
+    lambda_vals     = []
+    h_v_vals        = []
+    kl_divs         = []   # KL(topology_policy || baseline_policy) per move
+    move_num        = 0
+
+    while not game.game_over:
+        legal = game.get_legal_moves()
+        if not legal:
+            game.make_move(None)
+            move_num += 1
+            continue
+
+        if game.current_player == topology_player:
+            move, top_policy, stats = topology_mcts.search(
+                game, temperature=temperature, add_dirichlet=False
+            )
+            # Also get baseline policy for KL — same position, don't advance game
+            _, base_policy, _ = baseline_mcts.search(
+                game, temperature=temperature, add_dirichlet=False
+            )
+            topology_sims   += stats.get('simulations', 0)
+            topology_tactic += int(stats.get('tactical', False))
+            if not stats.get('tactical', False):
+                lambda_vals.append(stats.get('lambda_h', 0.0))
+                h_v_vals.append(stats.get('H_v', 0.0))
+                # KL(topology || baseline) — how different are the policies?
+                p = top_policy + 1e-10;  p /= p.sum()
+                q = base_policy + 1e-10; q /= q.sum()
+                kl = float(np.sum(p * np.log(p / q)))
+                kl_divs.append(kl)
+        else:
+            move, _, stats = baseline_mcts.search(
+                game, temperature=temperature, add_dirichlet=False
+            )
+            baseline_sims   += stats.get('simulations', 0)
+            baseline_tactic += int(stats.get('tactical', False))
+
+        game.make_move(move)
+        move_num += 1
+
+    topology_moves = move_num // 2 + (1 if topology_is_black else 0)
+
+    return GameResult(
+        winner=game.winner,
+        topology_player=topology_player,
+        topology_win=(game.winner == topology_player),
+        topology_draw=(game.winner == 0),
+        game_length=move_num,
+        topology_sims=topology_sims,
+        baseline_sims=baseline_sims,
+        topology_tactical=topology_tactic,
+        baseline_tactical=baseline_tactic,
+        topology_avg_lambda=float(np.mean(lambda_vals)) if lambda_vals else 0.0,
+        topology_avg_H_v=float(np.mean(h_v_vals)) if h_v_vals else 0.0,
+        avg_kl_divergence=float(np.mean(kl_divs)) if kl_divs else 0.0,
+
+    )
+
+
+# ── Matchup runner ────────────────────────────────────────────────────────────
+
+def run_matchup(
+    name:           str,
+    net:            CompactReversiNet,
+    thresholds:     dict,
+    num_games:      int,
+    temperature:    float,
+    baseline_budget:int,
+    topology_config:dict,   # enable_* flags
+    lam_ctrl_state: dict = {},
+) -> MatchupResult:
+    """Run num_games between topology MCTS (config) and pure baseline."""
+
+    solver    = TacticalSolver()
+    heuristic = PatternHeuristic()
+
+    topology_mcts = TopologyAwareMCTS(
+        network=net,
+        tactical_solver=TacticalSolver(),
+        pattern_heuristic=PatternHeuristic(),
+        **topology_config,
+    )
+    topology_mcts.set_thresholds(thresholds)
+
+    # Restore learned λ weights if checkpoint contains them.
+    # Without this, LearnedLambdaController defaults to hardcoded init (λ≈0.727)
+    # even when the checkpoint was trained with dynamic λ.
+    if lam_ctrl_state and lam_ctrl_state.get('w_h'):
+        from reversi_phase5_learned_lambda import LearnedLambdaController
+        if isinstance(topology_mcts.lam_ctrl, LearnedLambdaController):
+            import numpy as _np
+            topology_mcts.lam_ctrl.w_h[:] = _np.array(lam_ctrl_state['w_h'])
+            topology_mcts.lam_ctrl.w_e[:] = _np.array(lam_ctrl_state['w_e'])
+
+    baseline_mcts = PureMCTS(
+        network=net,
+        tactical_solver=TacticalSolver(),
+        use_tactical=True,
+    )
+    # Override budget
+    baseline_mcts.__class__.BUDGET = baseline_budget
+
+    results: List[GameResult] = []
+    t0 = time.time()
+    label = name[:38]
+
+    for i in range(num_games):
+        topology_is_black = (i % 2 == 0)
+        r = play_game(topology_mcts, baseline_mcts, topology_is_black, temperature)
+        results.append(r)
+        if (i + 1) % PRINT_EVERY == 0 or (i + 1) == num_games:
+            _progress(label, i + 1, num_games, results, t0)
+
+    # Aggregate
+    wins   = sum(r.topology_win  for r in results)
+    draws  = sum(r.topology_draw for r in results)
+    losses = num_games - wins - draws
+
+    avg_top_sims  = np.mean([r.topology_sims  for r in results])
+    avg_base_sims = np.mean([r.baseline_sims  for r in results])
+    sim_savings   = (avg_base_sims - avg_top_sims) / (avg_base_sims + 1e-8) * 100
+
+    # Binomial test: is win rate significantly different from 50%?
+    binom = scipy_stats.binomtest(wins, num_games, p=0.5, alternative='two-sided')
+
+    avg_kl = float(np.mean([r.avg_kl_divergence for r in results]))
+    # Tactical rate across all topology moves
+    total_top_moves   = sum(r.game_length for r in results) // 2
+    total_top_tactic  = sum(r.topology_tactical for r in results)
+    tactic_rate       = total_top_tactic / (total_top_moves + 1e-8)
+
+    return MatchupResult(
+        name=name,
+        games=num_games,
+        wins=wins, draws=draws, losses=losses,
+        win_rate=wins/num_games,
+        draw_rate=draws/num_games,
+        loss_rate=losses/num_games,
+        avg_sims_topology=float(avg_top_sims),
+        avg_sims_baseline=float(avg_base_sims),
+        sim_savings_pct=float(sim_savings),
+        avg_game_length=float(np.mean([r.game_length for r in results])),
+        avg_tactical_rate=float(tactic_rate),
+        avg_lambda=float(np.mean([r.topology_avg_lambda for r in results])),
+        avg_H_v=float(np.mean([r.topology_avg_H_v for r in results])),
+        p_value=float(binom.pvalue),
+        significant=bool(binom.pvalue < 0.05),
+        avg_kl_divergence=avg_kl,
+    )
+
+
+# ── Ablation configurations ───────────────────────────────────────────────────
+
+def get_ablation_configs(min_budget: int = 80, max_budget: int = 900) -> List[Tuple[str, dict]]:
+    """
+    Ablation suite — three sections:
+
+    Section A — additive: start from nothing, add layers one by one.
+                Shows marginal contribution of each layer.
+
+    Section B — leave-one-out: start from full system, remove one layer.
+                Shows what each layer is actually worth in context.
+
+    Section C — L4/L5 coupling diagnostic.
+                Isolates whether dynamic exploration (L5) is independently
+                useful or purely compensating for dynamic λ (L4) instability.
+                Key question: does L5 help when L4 is absent?
+    """
+    all_on = dict(
+        enable_heuristic=True,
+        enable_soft_pruning=True,
+        enable_dynamic_lambda=True,
+        enable_dynamic_exploration=True,
+        enable_early_stop=True,
+        enable_lambda_budget=True,
+        enable_logging=False,
+        min_budget=min_budget,
+        max_budget=max_budget,
+    )
+    base = dict(
+        enable_heuristic=False,
+        enable_soft_pruning=False,
+        enable_dynamic_lambda=False,
+        enable_dynamic_exploration=False,
+        enable_early_stop=False,
+        enable_lambda_budget=False,
+        enable_logging=False,
+    )
+
+    configs = [
+        # ── Section A: additive ───────────────────────────────────────────────
+        ("A1: +L2 only (heuristic, fixed λ=0.05)", {
+            **base,
+            'enable_heuristic': True,
+        }),
+        ("A2: +L2+L4 (+ dynamic λ)", {
+            **base,
+            'enable_heuristic': True,
+            'enable_dynamic_lambda': True,
+        }),
+        ("A3: +L2+L4+L5 (+ dynamic exploration)", {
+            **base,
+            'enable_heuristic': True,
+            'enable_dynamic_lambda': True,
+            'enable_dynamic_exploration': True,
+        }),
+        ("A4: +L2+L4+L5+L6 (+ early stop)", {
+            **base,
+            'enable_heuristic': True,
+            'enable_dynamic_lambda': True,
+            'enable_dynamic_exploration': True,
+            'enable_early_stop': True,
+        }),
+        ("A5: All layers (full system)", dict(**all_on)),
+
+        # ── Section B: leave-one-out ──────────────────────────────────────────
+        ("B1: Full − soft pruning (L3)", {
+            **all_on,
+            'enable_soft_pruning': False,
+        }),
+        ("B2: Full − budget allocator (L7)", {
+            **all_on,
+            'enable_lambda_budget': False,
+        }),
+
+        # ── Section C: L4/L5 coupling diagnostic ─────────────────────────────
+        ("C1: L2+L5 only (explore, NO dynamic λ)", {
+            **base,
+            'enable_heuristic': True,
+            'enable_dynamic_exploration': True,
+        }),
+        ("C2: L2+L4 only (dynamic λ, NO explore)", {
+            **base,
+            'enable_heuristic': True,
+            'enable_dynamic_lambda': True,
+        }),
+        ("C3: L2+L4+L5 (both — coupling check)", {
+            **base,
+            'enable_heuristic': True,
+            'enable_dynamic_lambda': True,
+            'enable_dynamic_exploration': True,
+        }),
+    ]
+    return configs
+
+
+# ── Result printing ───────────────────────────────────────────────────────────
+
+def print_result(r: MatchupResult):
+    sig = "✓ p<0.05" if r.significant else "  n.s."
+    print(f"\n  ┌─ {r.name}")
+    print(f"  │  W={r.wins} D={r.draws} L={r.losses}  "
+          f"WR={r.win_rate:.1%}  ({sig}  p={r.p_value:.3f})")
+    print(f"  │  Sims: topology={r.avg_sims_topology:.0f}  "
+          f"baseline={r.avg_sims_baseline:.0f}  "
+          f"savings={r.sim_savings_pct:+.1f}%")
+    print(f"  │  Game length={r.avg_game_length:.1f}  "
+          f"tactical_rate={r.avg_tactical_rate:.1%}")
+    print(f"  └  λ̄={r.avg_lambda:.3f}  H̄_v={r.avg_H_v:.3f}  KL={r.avg_kl_divergence:.4f}")
+
+def worker_fn(worker_games, start_idx, result_q,
+              state_dict,
+              thresholds,
+              topology_config,
+              baseline_budget,
+              temperature,
+              master_seed,
+              worker_id,
+              lam_ctrl_state):
+
+    import random as _random
+    # Deterministic per-worker seed derived from master — reproducible across runs
+    worker_seed = master_seed + worker_id
+    np.random.seed(worker_seed)
+    _random.seed(worker_seed)
+
+    from reversi_phase5_topology_core import (
+        ReversiGame, TacticalSolver, PatternHeuristic, CompactReversiNet
+    )
+    from reversi_phase5_topology_layers import TopologyAwareMCTS
+    from reversi_phase5_baseline import PureMCTS
+
+    # Recreate network locally
+    net = CompactReversiNet(8, 128)
+    net.load_state_dict(state_dict)
+    net.eval()
+
+    top_mcts = TopologyAwareMCTS(
+        network=net,
+        tactical_solver=TacticalSolver(),
+        pattern_heuristic=PatternHeuristic(),
+        **topology_config,
+    )
+    top_mcts.set_thresholds(thresholds)
+
+    # Restore learned λ weights from checkpoint into this worker's local controller
+    if lam_ctrl_state and lam_ctrl_state.get('w_h'):
+        from reversi_phase5_learned_lambda import LearnedLambdaController
+        if isinstance(top_mcts.lam_ctrl, LearnedLambdaController):
+            import numpy as _np
+            top_mcts.lam_ctrl.w_h[:] = _np.array(lam_ctrl_state['w_h'])
+            top_mcts.lam_ctrl.w_e[:] = _np.array(lam_ctrl_state['w_e'])
+
+    base_mcts = PureMCTS(
+        network=net,
+        tactical_solver=TacticalSolver(),
+        use_tactical=True,
+    )
+    base_mcts.__class__.BUDGET = baseline_budget
+
+    results = []
+
+    for i in range(worker_games):
+        tib = ((start_idx + i) % 2 == 0)
+        r = play_game(top_mcts, base_mcts, tib, temperature)
+        results.append(r)
+
+    result_q.put(results)
+
+def run_matchup_parallel(
+    name:           str,
+    net:            CompactReversiNet,
+    thresholds:     dict,
+    num_games:      int,
+    temperature:    float,
+    baseline_budget:int,
+    topology_config:dict,
+    num_workers:    int,
+    master_seed:    int = 42,
+    lam_ctrl_state: dict = {},
+) -> MatchupResult:
+    """
+    Parallel version of run_matchup.
+    Splits games across workers, each worker runs its slice sequentially.
+    Safe because games are fully independent and network is read-only (inference).
+    """
+    import multiprocessing as mp
+    from functools import partial
+
+    games_per_worker = [num_games // num_workers] * num_workers
+    for i in range(num_games % num_workers):
+        games_per_worker[i] += 1
+
+    # Offset game indices so colour alternation stays correct across workers
+    offsets = [sum(games_per_worker[:i]) for i in range(num_workers)]
+
+    ctx = mp.get_context('fork')
+
+
+
+    result_q = ctx.Queue()
+    procs = []
+    for wid in range(num_workers):
+        p = ctx.Process(
+            target=worker_fn,
+            args=(
+                games_per_worker[wid],
+                offsets[wid],
+                result_q,
+                net.state_dict(),
+                thresholds,
+                topology_config,
+                baseline_budget,
+                temperature,
+                master_seed,
+                wid,
+                lam_ctrl_state,
+            ),
+        )
+
+        p.start()
+        procs.append(p)
+
+    all_results = []
+    t0 = time.time()
+    label = name[:38]
+    for _ in range(num_workers):
+        batch = result_q.get(timeout=7200)
+        all_results.extend(batch)
+        _progress(label, len(all_results), num_games, all_results, t0)
+    for p in procs:
+        p.join(timeout=30)
+
+    # Aggregate exactly as run_matchup does
+    wins   = sum(r.topology_win  for r in all_results)
+    draws  = sum(r.topology_draw for r in all_results)
+    losses = num_games - wins - draws
+    avg_top_sims  = np.mean([r.topology_sims  for r in all_results])
+    avg_base_sims = np.mean([r.baseline_sims  for r in all_results])
+    sim_savings   = (avg_base_sims - avg_top_sims) / (avg_base_sims + 1e-8) * 100
+    binom = scipy_stats.binomtest(wins, num_games, p=0.5, alternative='two-sided')
+    total_top_moves  = sum(r.game_length for r in all_results) // 2
+    total_top_tactic = sum(r.topology_tactical for r in all_results)
+    tactic_rate      = total_top_tactic / (total_top_moves + 1e-8)
+    lambda_vals = [r.topology_avg_lambda for r in all_results]
+    h_v_vals    = [r.topology_avg_H_v    for r in all_results]
+    kl_vals     = [r.avg_kl_divergence   for r in all_results]
+
+    return MatchupResult(
+        name=name, games=num_games,
+        wins=wins, draws=draws, losses=losses,
+        win_rate=wins/num_games, draw_rate=draws/num_games, loss_rate=losses/num_games,
+        avg_sims_topology=float(avg_top_sims),
+        avg_sims_baseline=float(avg_base_sims),
+        sim_savings_pct=float(sim_savings),
+        avg_game_length=float(np.mean([r.game_length for r in all_results])),
+        avg_tactical_rate=float(tactic_rate),
+        avg_lambda=float(np.mean(lambda_vals)),
+        avg_H_v=float(np.mean(h_v_vals)),
+        avg_kl_divergence=float(np.mean(kl_vals)),
+        p_value=float(binom.pvalue),
+        significant=bool(binom.pvalue < 0.05),
+    )
+
+
+def baseline_worker_fn(num_games, start_idx, result_q,
+                       state_dict, budget_a, budget_b, temperature,
+                       master_seed, worker_id):
+    """Worker for baseline-vs-baseline parallel games."""
+    import random as _random
+    worker_seed = master_seed + worker_id
+    np.random.seed(worker_seed)
+    _random.seed(worker_seed)
+
+    from reversi_phase5_topology_core import (
+        ReversiGame, TacticalSolver, CompactReversiNet
+    )
+    from reversi_phase5_baseline import PureMCTS
+
+    net = CompactReversiNet(8, 128)
+    net.load_state_dict(state_dict)
+    net.eval()
+
+    class BaselineA(PureMCTS):
+        BUDGET = budget_a
+    class BaselineB(PureMCTS):
+        BUDGET = budget_b
+
+    mcts_a = BaselineA(net, TacticalSolver())
+    mcts_b = BaselineB(net, TacticalSolver())
+
+    results = []
+    for i in range(num_games):
+        b_is_black = ((start_idx + i) % 2 == 0)
+        game    = ReversiGame()
+        b_player = 1 if b_is_black else -1
+        b_sims = 0; a_sims = 0
+        b_tactic = 0; a_tactic = 0
+        move_num = 0
+        while not game.game_over:
+            legal = game.get_legal_moves()
+            if not legal:
+                game.make_move(None); move_num += 1; continue
+            if game.current_player == b_player:
+                move, _, stats = mcts_b.search(game, temperature=temperature)
+                b_sims   += stats.get('simulations', 0)
+                b_tactic += int(stats.get('tactical', False))
+            else:
+                move, _, stats = mcts_a.search(game, temperature=temperature)
+                a_sims   += stats.get('simulations', 0)
+                a_tactic += int(stats.get('tactical', False))
+            game.make_move(move); move_num += 1
+
+        results.append(GameResult(
+            winner=game.winner,
+            topology_player=b_player,
+            topology_win=(game.winner == b_player),
+            topology_draw=(game.winner == 0),
+            game_length=move_num,
+            topology_sims=b_sims,
+            baseline_sims=a_sims,
+            topology_tactical=b_tactic,
+            baseline_tactical=a_tactic,
+            topology_avg_lambda=0.0,
+            topology_avg_H_v=0.0,
+            avg_kl_divergence=0.0,
+        ))
+
+    result_q.put(results)
+
+
+def run_baseline_vs_baseline(
+    net:           CompactReversiNet,
+    num_games:     int,
+    temperature:   float,
+    budget_a:      int,
+    budget_b:      int,
+    num_workers:   int = 1,
+    master_seed:   int = 42,
+) -> MatchupResult:
+    """
+    Pits Baseline-A (budget_a sims) against Baseline-B (budget_b sims).
+    Reported from Baseline-B's perspective so you can compare directly
+    with ZenoZero's win rate against Baseline-A.
+
+    Runs in parallel when num_workers > 1 (same pattern as run_matchup_parallel).
+    """
+    name = f"Baseline-{budget_b} vs Baseline-{budget_a} (compute control)"
+
+    if num_workers > 1:
+        # ── Parallel path ─────────────────────────────────────────────────────
+        games_per_worker = [num_games // num_workers] * num_workers
+        for i in range(num_games % num_workers):
+            games_per_worker[i] += 1
+        offsets = [sum(games_per_worker[:i]) for i in range(num_workers)]
+
+        ctx = mp.get_context('fork')
+        result_q = ctx.Queue()
+        procs = []
+        for wid in range(num_workers):
+            p = ctx.Process(
+                target=baseline_worker_fn,
+                args=(
+                    games_per_worker[wid],
+                    offsets[wid],
+                    result_q,
+                    net.state_dict(),
+                    budget_a,
+                    budget_b,
+                    temperature,
+                    master_seed,
+                    wid,
+                ),
+            )
+            p.start()
+            procs.append(p)
+
+        results = []
+        t0 = time.time()
+        label = name[:38]
+        for _ in range(num_workers):
+            batch = result_q.get(timeout=7200)
+            results.extend(batch)
+            _progress(label, len(results), num_games, results, t0)
+        for p in procs:
+            p.join(timeout=30)
+
+    else:
+        # ── Sequential path ────────────────────────────────────────────────────
+        from reversi_phase5_baseline import PureMCTS
+
+        class BaselineA(PureMCTS):
+            BUDGET = budget_a
+        class BaselineB(PureMCTS):
+            BUDGET = budget_b
+
+        mcts_a = BaselineA(net, TacticalSolver())
+        mcts_b = BaselineB(net, TacticalSolver())
+
+        results = []
+        t0 = time.time()
+        label = name[:38]
+        for i in range(num_games):
+            b_is_black = (i % 2 == 0)
+            game     = ReversiGame()
+            b_player = 1 if b_is_black else -1
+            b_sims = 0; a_sims = 0
+            b_tactic = 0; a_tactic = 0
+            move_num = 0
+            while not game.game_over:
+                legal = game.get_legal_moves()
+                if not legal:
+                    game.make_move(None); move_num += 1; continue
+                if game.current_player == b_player:
+                    move, _, stats = mcts_b.search(game, temperature=temperature)
+                    b_sims   += stats.get('simulations', 0)
+                    b_tactic += int(stats.get('tactical', False))
+                else:
+                    move, _, stats = mcts_a.search(game, temperature=temperature)
+                    a_sims   += stats.get('simulations', 0)
+                    a_tactic += int(stats.get('tactical', False))
+                game.make_move(move); move_num += 1
+
+            results.append(GameResult(
+                winner=game.winner,
+                topology_player=b_player,
+                topology_win=(game.winner == b_player),
+                topology_draw=(game.winner == 0),
+                game_length=move_num,
+                topology_sims=b_sims,
+                baseline_sims=a_sims,
+                topology_tactical=b_tactic,
+                baseline_tactical=a_tactic,
+                topology_avg_lambda=0.0,
+                topology_avg_H_v=0.0,
+                avg_kl_divergence=0.0,
+            ))
+            if (i + 1) % PRINT_EVERY == 0 or (i + 1) == num_games:
+                _progress(label, i + 1, num_games, results, t0)
+
+    wins   = sum(r.topology_win  for r in results)
+    draws  = sum(r.topology_draw for r in results)
+    losses = num_games - wins - draws
+    avg_b  = np.mean([r.topology_sims for r in results])
+    avg_a  = np.mean([r.baseline_sims for r in results])
+    sim_savings = (avg_a - avg_b) / (avg_a + 1e-8) * 100
+    binom = scipy_stats.binomtest(wins, num_games, p=0.5, alternative='two-sided')
+
+    return MatchupResult(
+        name=name,
+        games=num_games, wins=wins, draws=draws, losses=losses,
+        win_rate=wins/num_games, draw_rate=draws/num_games, loss_rate=losses/num_games,
+        avg_sims_topology=float(avg_b),
+        avg_sims_baseline=float(avg_a),
+        sim_savings_pct=float(sim_savings),
+        avg_game_length=float(np.mean([r.game_length for r in results])),
+        avg_tactical_rate=0.0,
+        avg_lambda=0.0,
+        avg_H_v=0.0,
+        avg_kl_divergence=0.0,
+        p_value=float(binom.pvalue),
+        significant=bool(binom.pvalue < 0.05),
+    )
+def _print_multiseed_summary(seed_results: List[List[dict]], seeds: List[int]):
+    """
+    Aggregate ablation results across multiple seeds.
+    seed_results[i] = list of result dicts for seed i (one per ablation config).
+    Prints mean WR ± std, mean savings, and consistency flag.
+    """
+    if not seed_results or not seed_results[0]:
+        return
+
+    n_configs = len(seed_results[0])
+    n_seeds   = len(seeds)
+
+    print(f"\n\n  {'═'*72}")
+    print(f"  MULTI-SEED ABLATION SUMMARY  ({n_seeds} seeds: {seeds})")
+    print(f"  {'═'*72}")
+    print(f"  {'Configuration':<42} {'WR mean':>8}  {'±std':>6}  {'Savings':>8}  {'Consistent':>10}")
+    print(f"  {'─'*72}")
+
+    for ci in range(n_configs):
+        name = seed_results[0][ci]['name']
+        wrs      = [seed_results[si][ci]['win_rate']       for si in range(n_seeds)]
+        savings  = [seed_results[si][ci]['sim_savings_pct'] for si in range(n_seeds)]
+        sigs     = [seed_results[si][ci]['significant']     for si in range(n_seeds)]
+
+        mean_wr   = float(np.mean(wrs))
+        std_wr    = float(np.std(wrs))
+        mean_sav  = float(np.mean(savings))
+        # Consistent = all seeds agree on significance direction
+        all_sig   = all(sigs)
+        none_sig  = not any(sigs)
+        consistent = "✓ all sig" if all_sig else ("✓ none sig" if none_sig else "~ mixed")
+
+        print(f"  {name:<42} {mean_wr:>7.1%}  {std_wr:>6.1%}  {mean_sav:>+7.1f}%  {consistent:>10}")
+
+    print(f"  {'─'*72}")
+
+    # Section C coupling verdict
+    c_names = [r['name'] for r in seed_results[0]]
+    c1_idx = next((i for i,n in enumerate(c_names) if n.startswith('C1')), None)
+    c2_idx = next((i for i,n in enumerate(c_names) if n.startswith('C2')), None)
+    c3_idx = next((i for i,n in enumerate(c_names) if n.startswith('C3')), None)
+
+    if c1_idx is not None and c2_idx is not None and c3_idx is not None:
+        c1_wr = np.mean([seed_results[si][c1_idx]['win_rate'] for si in range(n_seeds)])
+        c2_wr = np.mean([seed_results[si][c2_idx]['win_rate'] for si in range(n_seeds)])
+        c3_wr = np.mean([seed_results[si][c3_idx]['win_rate'] for si in range(n_seeds)])
+
+        print(f"\n  L4/L5 COUPLING VERDICT:")
+        print(f"    C1 (L5 alone, no L4):    WR={c1_wr:.1%}")
+        print(f"    C2 (L4 alone, no L5):    WR={c2_wr:.1%}")
+        print(f"    C3 (L4+L5 together):     WR={c3_wr:.1%}")
+        synergy = c3_wr - max(c1_wr, c2_wr)
+        if c1_wr < 0.52 and c2_wr < 0.52 and c3_wr > 0.60:
+            verdict = "ACCIDENTAL COMPENSATION — neither helps alone, together they cancel instability"
+        elif c1_wr > 0.57 and abs(c3_wr - c1_wr) < 0.05:
+            verdict = "L5 INDEPENDENT — L5 useful alone, L4 adds little on top"
+        elif c1_wr > 0.57 and c3_wr > c1_wr:
+            verdict = "GENUINE SYNERGY — L5 helps alone AND further improves with L4"
+        elif c2_wr < 0.50 and c3_wr > 0.57:
+            verdict = "L5 CORRECTS L4 — L4 hurts alone, L5 rescues it (compensation)"
+        else:
+            verdict = f"INCONCLUSIVE — synergy delta={synergy:+.1%}, need more games"
+        print(f"    → {verdict}")
+    print(f"  {'═'*72}\n")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    cfg = get_config()
+
+    if cfg.workers is None:
+        cfg.workers = max(1, mp.cpu_count() // 2 - 1)
+
+    print(f"\n{'='*65}")
+    print(f"  REVERSI PHASE 5 BENCHMARK")
+    print(f"{'='*65}")
+    print(f"  Games per matchup: {cfg.games}")
+    print(f"  Temperature:       {cfg.temperature}")
+    print(f"  Baseline budget:   {cfg.baseline_budget}")
+    print(f"  Topology budget:   [{cfg.min_budget}, {cfg.max_budget}] (difficulty-proportional)")
+    print(f"  Ablation:          {cfg.ablation}")
+    seeds = [int(s.strip()) for s in cfg.seeds.split(',')] if cfg.seeds else [cfg.seed]
+    print(f"  Seeds:             {seeds}")
+    print(f"{'='*65}\n")
+
+    # ── Determinism ───────────────────────────────────────────────────────────
+    import random as _random
+    _random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    torch.cuda.manual_seed_all(cfg.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+
+    # Load network
+    net = CompactReversiNet(8, 128)
+    thresholds = {'H_v_thresh': 0.20, 'G_thresh': 0.50, 'Var_Q_thresh': 0.02}
+
+    lam_ctrl_state: dict = {}   # learned λ weights — empty = use hardcoded init
+
+    if cfg.checkpoint:
+        print(f"  Loading checkpoint: {cfg.checkpoint}")
+        ckpt = torch.load(cfg.checkpoint, map_location='cpu', weights_only=False)
+        net.load_state_dict(ckpt['model_state_dict'])
+        thresholds = ckpt.get('thresholds', thresholds)
+        lam_ctrl_state = ckpt.get('lam_ctrl_state', {})
+        print(f"  Thresholds from checkpoint: {thresholds}")
+        if lam_ctrl_state and lam_ctrl_state.get('w_h'):
+            print(f"  LearnedLambdaController weights found in checkpoint  "
+                  f"(updates={lam_ctrl_state.get('total_updates', '?')}  "
+                  f"w_h={[round(w,3) for w in lam_ctrl_state['w_h']]})")
+        else:
+            print(f"  No lam_ctrl_state in checkpoint — lambda will use hardcoded init")
+    else:
+        print("  ⚠ No checkpoint — using random network weights")
+        print("  (Results will reflect MCTS structure only, not learned play)")
+        print(f"  Using hardcoded default thresholds: {thresholds}")
+
+    print(f"  NOTE: Benchmark uses fixed thresholds — no calibration run.")
+    print(f"        Recalibration belongs only inside training.\n")
+
+    net.eval()
+
+    full_config = dict(
+        enable_heuristic=True,
+        enable_soft_pruning=True,
+        enable_dynamic_lambda=True,
+        enable_dynamic_exploration=True,
+        enable_early_stop=True,
+        enable_lambda_budget=True,
+        enable_logging=False,
+        min_budget=cfg.min_budget,
+        max_budget=cfg.max_budget,
+    )
+
+    all_results = []
+
+    # ── Main matchup: Full topology vs Baseline ───────────────────────────────
+    print(f"{'─'*65}")
+    print(f"  MAIN MATCHUP: Full Topology vs Pure MCTS (800 sims)")
+    print(f"{'─'*65}")
+
+    t0 = time.time()
+    runner = run_matchup_parallel if cfg.parallel_games else run_matchup
+
+    main_result = runner(
+        name="Full Topology vs Baseline",
+        net=net,
+        thresholds=thresholds,
+        num_games=cfg.games,
+        temperature=cfg.temperature,
+        baseline_budget=cfg.baseline_budget,
+        topology_config=full_config,
+        lam_ctrl_state=lam_ctrl_state,
+        **({"num_workers": cfg.workers, "master_seed": cfg.seed} if cfg.parallel_games else {}),
+    )
+
+    print_result(main_result)
+    all_results.append(asdict(main_result))
+    print(f"\n  Main matchup done in {time.time()-t0:.1f}s")
+
+    # ── Ablation matrix (optionally multi-seed) ───────────────────────────────
+    ablation_results = []        # last seed's results (for single-seed compat)
+    seed_results_all = []        # [seed_idx][config_idx] → result dict
+
+    if cfg.ablation:
+        ablation_games = max(50, cfg.games // 2)
+        runner = run_matchup_parallel if cfg.parallel_games else run_matchup
+
+        for seed_idx, abl_seed in enumerate(seeds):
+            # Re-seed for this ablation seed
+            import random as _random_abl
+            _random_abl.seed(abl_seed)
+            np.random.seed(abl_seed)
+            torch.manual_seed(abl_seed)
+
+            print(f"\n{'─'*65}")
+            if len(seeds) > 1:
+                print(f"  LAYER ABLATION MATRIX  [seed {abl_seed}  ({seed_idx+1}/{len(seeds)})]")
+            else:
+                print(f"  LAYER ABLATION MATRIX")
+            print(f"{'─'*65}")
+            print(f"  Each config tested for {ablation_games} games vs baseline\n")
+
+            seed_results = []
+
+            # Section headers for readability
+            section_map = {'A': '── Section A: Additive ──────────────────────────────────',
+                           'B': '── Section B: Leave-one-out ─────────────────────────────',
+                           'C': '── Section C: L4/L5 Coupling Diagnostic ────────────────'}
+            last_section = None
+
+            for abl_name, abl_cfg in get_ablation_configs(cfg.min_budget, cfg.max_budget):
+                section = abl_name[0]  # 'A', 'B', or 'C'
+                if section != last_section and section in section_map:
+                    print(f"\n  {section_map[section]}")
+                    last_section = section
+
+                print(f"\n  Testing: {abl_name}")
+                abl_result = runner(
+                    name=abl_name,
+                    net=net,
+                    thresholds=thresholds,
+                    num_games=ablation_games,
+                    temperature=cfg.temperature,
+                    baseline_budget=cfg.baseline_budget,
+                    topology_config=abl_cfg,
+                    lam_ctrl_state=lam_ctrl_state,
+                    **({"num_workers": cfg.workers, "master_seed": abl_seed} if cfg.parallel_games else {}),
+                )
+                print_result(abl_result)
+                r_dict = asdict(abl_result)
+                seed_results.append(r_dict)
+                all_results.append(r_dict)
+
+            ablation_results = seed_results   # keep last seed for compat
+            seed_results_all.append(seed_results)
+
+            # Per-seed summary table
+            print(f"\n\n  {'─'*60}")
+            print(f"  ABLATION SUMMARY  [seed={abl_seed}]")
+            print(f"  {'─'*60}")
+            print(f"  {'Configuration':<42} {'WR':>6}  {'Savings':>8}  {'Sig':>5}")
+            print(f"  {'─'*60}")
+            for r_dict in seed_results:
+                r = MatchupResult(**r_dict)
+                sig = "✓" if r.significant else " "
+                print(f"  {r.name:<42} {r.win_rate:>6.1%}  "
+                      f"{r.sim_savings_pct:>+7.1f}%  {sig:>5}")
+            print(f"  {'─'*60}")
+
+        # Multi-seed aggregated summary (only when >1 seed)
+        if len(seeds) > 1:
+            _print_multiseed_summary(seed_results_all, seeds)
+
+    # Compute control: does ZenoZero beat naive budget reduction?
+    if cfg.baseline_vs_baseline:
+        print(f"\n{'─'*65}")
+        print(f"  COMPUTE CONTROL: Baseline-{cfg.compute_control_budget} vs Baseline-{cfg.baseline_budget}")
+        print(f"  (isolates whether ZenoZero adds value beyond just using fewer sims)")
+        print(f"{'─'*65}")
+        ctrl_result = run_baseline_vs_baseline(
+            net=net,
+            num_games=cfg.games,
+            temperature=cfg.temperature,
+            budget_a=cfg.baseline_budget,
+            budget_b=cfg.compute_control_budget,
+            num_workers=cfg.workers if cfg.parallel_games else 1,
+            master_seed=cfg.seed,
+        )
+        print_result(ctrl_result)
+        all_results.append(asdict(ctrl_result))
+        print(f"\n  Interpretation:")
+        delta = main_result.win_rate - ctrl_result.win_rate
+        print(f"  ZenoZero WR={main_result.win_rate:.1%}  vs  "
+              f"Naive-reduction WR={ctrl_result.win_rate:.1%}  "
+              f"→ topology adds {delta:+.1%}")
+        print(f"  Done in {time.time()-t0:.1f}s")
+
+    # ── Save results ──────────────────────────────────────────────────────────
+    output = {
+        'config': vars(cfg),
+        'thresholds': thresholds,
+        'results': all_results,
+        'timestamp': time.time(),
+    }
+    with open(cfg.output, 'w') as f:
+        json.dump(output, f, indent=2)
+    print(f"\n  Results saved to {cfg.output}")
+
+    # ── Final summary ─────────────────────────────────────────────────────────
+    r = main_result
+    print(f"\n{'='*65}")
+    print(f"  SUMMARY")
+    print(f"{'='*65}")
+    print(f"  Win rate:       {r.win_rate:.1%}  (vs 50% baseline)")
+    print(f"  Compute savings:{r.sim_savings_pct:+.1f}%  "
+          f"({r.avg_sims_topology:.0f} vs {r.avg_sims_baseline:.0f} sims/game)")
+    print(f"  Avg λ:          {r.avg_lambda:.3f}  (0=trust NN, 1=trust heuristic)")
+    print(f"  Avg H_v:        {r.avg_H_v:.3f}  (entropy, lower=more decisive)")
+    print(f"  Significance:   {'YES (p<0.05)' if r.significant else 'NO (need more games)'}")
+    print(f"{'='*65}\n")
+
+
+if __name__ == '__main__':
+    main()

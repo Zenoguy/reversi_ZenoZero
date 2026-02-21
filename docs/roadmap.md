@@ -471,3 +471,23 @@ Each phase asks a deeper question about computational rationality:
 - 8: Do these principles generalize?
 - 9: When should I reconsider my allocation strategy?
 - 10: Why does this work and when does it fail?
+
+```markdown 
+
+One Small Suggestion (Not Required)
+
+For research clarity:
+
+At some point, run an experiment:
+
+- Freeze NN
+
+- Train λ only for 200 games
+
+- See if λ alone adapts.
+
+> That isolates metareasoning from representation learning.
+
+But that’s later.
+
+```

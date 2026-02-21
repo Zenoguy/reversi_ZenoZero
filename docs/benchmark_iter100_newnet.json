@@ -1,0 +1,72 @@
+{
+  "config": {
+    "checkpoint": "checkpoints_v4/iter_0100.pt",
+    "games": 200,
+    "workers": 5,
+    "ablation": false,
+    "temperature": 0.0,
+    "baseline_budget": 800,
+    "min_budget": 80,
+    "max_budget": 900,
+    "output": "benchmark_iter100_newnet.json",
+    "parallel_games": true,
+    "baseline_vs_baseline": false,
+    "compute_control_budget": 400,
+    "seed": 42,
+    "seeds": null
+  },
+  "thresholds": {
+    "H_v_thresh": 0.15,
+    "G_thresh": 0.85,
+    "Var_Q_thresh": 0.01,
+    "mahal_model_dict": {
+      "ready": true,
+      "k": 1.0,
+      "mean_vec": [
+        0.37896460528189374,
+        0.6264259259259226,
+        0.06100327977278695
+      ],
+      "cov_inv": [
+        [
+          121.37184013222108,
+          70.30007715379475,
+          51.88154744645248
+        ],
+        [
+          70.30007715379476,
+          52.192348882322655,
+          25.94210674073081
+        ],
+        [
+          51.88154744645248,
+          25.942106740730804,
+          274.54139193620017
+        ]
+      ]
+    }
+  },
+  "results": [
+    {
+      "name": "Full Topology vs Baseline",
+      "games": 200,
+      "wins": 119,
+      "draws": 31,
+      "losses": 50,
+      "win_rate": 0.595,
+      "draw_rate": 0.155,
+      "loss_rate": 0.25,
+      "avg_sims_topology": 4641.415,
+      "avg_sims_baseline": 21884.0,
+      "sim_savings_pct": 78.79082891606708,
+      "avg_game_length": 60.24,
+      "avg_tactical_rate": 0.1045816733065993,
+      "avg_lambda": 0.5730650600163899,
+      "avg_H_v": 0.38689208593017427,
+      "p_value": 0.00872250124744714,
+      "significant": true,
+      "avg_kl_divergence": 0.9180596098106837
+    }
+  ],
+  "timestamp": 1771669927.3925722
+}

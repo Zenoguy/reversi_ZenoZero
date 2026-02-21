@@ -52,6 +52,7 @@ from reversi_phase5_topology_core import (
 from reversi_phase5_topology_layers import TopologyAwareMCTS, SelfPlayRecord
 from reversi_phase5_dynamic_threshold_recalibrator import DynamicRecalibrator
 from reversi_phase5_baseline import PureMCTS
+from reversi_phase5_learned_lambda import LearnedLambdaController
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -124,19 +125,6 @@ def get_config() -> argparse.Namespace:
                    help='Main process random seed. None = auto-select random seed each run '
                         '(recommended for training diversity). Workers use master_seed + worker_id '
                         'so runs are reproducible if seed is specified.')
-
-    # Policy head surgery
-    p.add_argument('--reinit-policy-head',  action='store_true',
-                   help='Reinitialise p_fc (the Linear(128,65) output layer of the policy head) '
-                        'after resuming. Use when policy loss has plateaued due to contaminated '
-                        'training targets. Keeps p_conv/p_bn (spatial feature extractor) intact — '
-                        'only the final layer that directly fitted to distorted visit distributions '
-                        'is reset. Combine with --policy-loss-weight 1.5 for the first run.')
-    p.add_argument('--policy-loss-weight',  type=float, default=1.0,
-                   help='Multiplier on policy cross-entropy loss. Default 1.0 (standard AlphaZero). '
-                        'Set 1.5 for ~10 iterations after --reinit-policy-head to give the fresh '
-                        'layer stronger gradient signal relative to the value head. Return to 1.0 '
-                        'once policy loss resumes dropping (usually within 5 iterations).')
 
     return p.parse_args()
 
@@ -242,14 +230,20 @@ def selfplay_worker(
                 net.eval()
                 if 'thresholds' in latest_state:
                     mcts.set_thresholds(latest_state['thresholds'])
+                # Sync learned λ weights from main process
+                if 'lam_ctrl_state' in latest_state and latest_state['lam_ctrl_state']:
+                    d = latest_state['lam_ctrl_state']
+                    if isinstance(mcts.lam_ctrl, LearnedLambdaController) and 'w_h' in d:
+                        mcts.lam_ctrl.w_h[:] = np.array(d['w_h'])
+                        mcts.lam_ctrl.w_e[:] = np.array(d['w_e'])
             else:
                 # Backward compatibility with bare state_dict
                 net.load_state_dict(latest_state)
                 net.eval()
 
-        # Play one complete game
-        records = _play_game(mcts, net, config_dict)
-        result_queue.put(records)
+        # Play one complete game — returns (records, lam_exp_data)
+        records, lam_exp = _play_game(mcts, net, config_dict)
+        result_queue.put({'records': records, 'lam_exp': lam_exp})
         games_played += 1
 
 
@@ -257,11 +251,12 @@ def _play_game(
     mcts:   TopologyAwareMCTS,
     net:    CompactReversiNet,
     cfg:    dict,
-) -> List[SelfPlayRecord]:
+) -> tuple[List[SelfPlayRecord], Optional[dict]]:
     """Play one self-play game, return annotated records."""
-    game    = ReversiGame()
-    records = []
-    move_num = 0
+    game        = ReversiGame()
+    records     = []
+    move_num    = 0
+    player_sign = 1   # always Black's perspective; lam update uses this to orient outcome
 
     # Reset MCTS stats between games
     mcts.tactical_moves    = 0
@@ -299,64 +294,26 @@ def _play_game(
     for r in records:
         r.set_outcome(game.winner)
 
-    return records
+    # Package lam_ctrl episode data for main-process learning.
+    # Workers do NOT call update_from_game — main process learns centrally.
+    lam_exp = None
+    if isinstance(mcts.lam_ctrl, LearnedLambdaController):
+        lam_exp = mcts.lam_ctrl.get_episode_data(game.winner, player_sign)
+        mcts.lam_ctrl._flush_episode()   # clear buffer for next game
 
-
-# ── Policy head surgery ───────────────────────────────────────────────────────
-
-def reinit_policy_head(net: CompactReversiNet):
-    """
-    Reinitialise only p_fc — the Linear(128, 65) layer that maps spatial
-    features directly to move probabilities.
-
-    Why only p_fc and not the whole policy head:
-      p_conv + p_bn learned *which spatial features predict good moves*.
-      That knowledge is board-geometry specific and genuinely trained — keeping
-      it means the fresh p_fc starts from meaningful inputs rather than noise.
-
-      p_fc is the layer that directly fitted to visit distributions. If those
-      distributions were contaminated (e.g. by soft-pruning distortion in the
-      pre-Fix #1 code), p_fc absorbs the bias as ground truth and stalls in a
-      local minimum. Policy loss plateauing at ~1.19 by iter 8 and not moving
-      for 92 iterations is the signature of this. Reinitialising p_fc breaks
-      out of that minimum while preserving the spatial feature extractor.
-
-    Initialisation:
-      Kaiming uniform — standard for layers preceding softmax.
-      Bias initialised to zero — no prior preference for any move.
-
-    After calling this, use --policy-loss-weight 1.5 for ~10 iterations to
-    give the fresh layer stronger gradient signal. Then return to 1.0.
-    """
-    with torch.no_grad():
-        nn.init.kaiming_uniform_(net.p_fc.weight, nonlinearity='linear')
-        nn.init.zeros_(net.p_fc.bias)
-
-    total_params = net.p_fc.weight.numel() + net.p_fc.bias.numel()
-    print(f"\n  ── Policy head surgery ──────────────────────────────────────")
-    print(f"  Reinitialised: p_fc  Linear(128, 65)  [{total_params:,} params]")
-    print(f"  Kept intact:   p_conv Conv2d(128→2, 1×1)  p_bn BatchNorm2d(2)")
-    print(f"  Expected:      policy_loss will spike then drop faster than before")
-    print(f"  ────────────────────────────────────────────────────────────\n")
+    return records, lam_exp
 
 
 # ── Training step ─────────────────────────────────────────────────────────────
 
 def train_step(
-    net:           CompactReversiNet,
-    optimizer:     optim.Optimizer,
-    loader:        DataLoader,
-    device:        torch.device,
-    num_steps:     int,
-    policy_weight: float = 1.0,
+    net:       CompactReversiNet,
+    optimizer: optim.Optimizer,
+    loader:    DataLoader,
+    device:    torch.device,
+    num_steps: int,
 ) -> Dict[str, float]:
-    """Run num_steps gradient updates. Returns loss stats.
-
-    policy_weight: multiplier on the policy cross-entropy term.
-      1.0 = standard AlphaZero (default).
-      1.5 = boosted — use for ~10 iters after --reinit-policy-head to give
-            the fresh p_fc layer stronger gradient signal vs the value head.
-    """
+    """Run num_steps gradient updates. Returns loss stats."""
     net.train()
     policy_losses = []
     value_losses  = []
@@ -381,8 +338,7 @@ def train_step(
             # prevents value head from dominating gradient when policy is noisy
             value_loss   = nn.functional.mse_loss(value_pred, value_targets)
 
-            # policy_weight > 1.0 boosts policy gradient signal after reinit
-            loss = policy_weight * policy_loss + 0.5 * value_loss
+            loss = policy_loss + 0.5 * value_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -412,7 +368,8 @@ def save_checkpoint(
     config:     argparse.Namespace,
     thresholds: dict,
     log:        list,
-    elo_history: Optional[list] = None,
+    elo_history:    Optional[list] = None,
+    lam_ctrl_state: Optional[dict] = None,
 ):
     torch.save({
         'model_state_dict':     net.state_dict(),
@@ -422,6 +379,7 @@ def save_checkpoint(
         'thresholds':           thresholds,
         'log':                  log,
         'elo_history':          elo_history or [],
+        'lam_ctrl_state':       lam_ctrl_state or {},
     }, path)
 
 
@@ -432,7 +390,7 @@ def load_checkpoint(path: str, net: CompactReversiNet, optimizer: optim.Optimize
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
     else:
         print("  ℹ  No optimizer state in checkpoint (migrated) — Adam starts fresh from LR warmup.")
-    return ckpt['iteration'], ckpt.get('thresholds', {}), ckpt.get('log', [])
+    return ckpt['iteration'], ckpt.get('thresholds', {}), ckpt.get('log', []), ckpt.get('lam_ctrl_state', {})
 
 
 # ── Elo evaluation ────────────────────────────────────────────────────────────
@@ -630,8 +588,6 @@ def main():
     print(f"  Batch size:     {cfg.batch_size}")
     print(f"  LR:             {cfg.lr}")
     print(f"  Target stop %%:  {cfg.target_stop_rate*100:.0f}%%")
-    print(f"  Policy weight:  {cfg.policy_loss_weight}{'  ← boosted (reinit mode)' if cfg.policy_loss_weight != 1.0 else ''}")
-    print(f"  Reinit p_fc:    {cfg.reinit_policy_head}")
     print(f"  Seed:           {'auto' if cfg.seed is None else cfg.seed}  (workers: master_seed + worker_id)")
     print(f"{'='*65}\n")
 
@@ -668,25 +624,32 @@ def main():
         return cfg.lr_decay ** decay_iters
 
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+    # ── LearnedLambdaController — main-process instance ───────────────────────
+    # This is the authoritative copy of the lambda weights. Workers carry
+    # read-only copies (synced via weight_push). Learning happens here only.
+    main_lam_ctrl = LearnedLambdaController.from_hardcoded()
+
     # Resume
     if cfg.resume:
         print(f"  Resuming from {cfg.resume}")
-        start_iter, thresholds, log = load_checkpoint(cfg.resume, net, optimizer)
+        start_iter, thresholds, log, lam_ctrl_state = load_checkpoint(cfg.resume, net, optimizer)
         start_iter += 1
+        # Restore learned λ weights if present in checkpoint
+        if lam_ctrl_state:
+            main_lam_ctrl = LearnedLambdaController.from_dict(lam_ctrl_state)
+            print(f"  Restored LearnedLambdaController: "
+                  f"w_h={[round(w,3) for w in main_lam_ctrl.w_h]}  "
+                  f"updates={main_lam_ctrl.total_updates}")
+            main_lam_ctrl.print_weights("  Restored λ weights:")
+        else:
+            print("  ℹ  No lam_ctrl state in checkpoint — starting from hardcoded init")
         buf_path = Path(cfg.resume).parent / 'replay_buffer.pkl'
         if buf_path.exists():
             buffer = ReplayBuffer.load(str(buf_path), cfg.buffer_size)
             print(f"  Loaded replay buffer: {len(buffer):,} positions")
 
     net.eval()
-
-    # ── Optional policy head surgery ──────────────────────────────────────────
-    if cfg.reinit_policy_head:
-        if not cfg.resume:
-            print("  ⚠  --reinit-policy-head has no effect without --resume "
-                  "(network is already randomly initialised)")
-        else:
-            reinit_policy_head(net)
 
     # ── Elo evaluator ─────────────────────────────────────────────────────────
     elo_evaluator = EloEvaluator(
@@ -748,7 +711,7 @@ def main():
 
     # Push initial weights + thresholds to all workers
     state = {k: v.cpu() for k, v in net.state_dict().items()}
-    payload = {'weights': state, 'thresholds': thresholds}
+    payload = {'weights': state, 'thresholds': thresholds, 'lam_ctrl_state': main_lam_ctrl.to_dict()}
     for q in weight_queues:
         try:
             q.put_nowait(payload)
@@ -773,21 +736,33 @@ def main():
 
         while games_this_iter < cfg.games_per_iter:
             try:
-                records = result_queue.get(timeout=120)
+                payload = result_queue.get(timeout=120)
+                # Unpack — workers send {'records': ..., 'lam_exp': ...}
+                # Backward compat: bare list of records still accepted
+                if isinstance(payload, dict):
+                    records  = payload['records']
+                    lam_exp  = payload.get('lam_exp')
+                else:
+                    records  = payload
+                    lam_exp  = None
+
                 buffer.push(records)
-                games_this_iter     += 1
-                games_collected     += 1
-                records_this_iter   += len(records)
+                games_this_iter   += 1
+                games_collected   += 1
+                records_this_iter += len(records)
+
+                # ── Centralised lam_ctrl learning ─────────────────────────────
+                if lam_exp is not None:
+                    main_lam_ctrl.update_from_experience(lam_exp)
 
                 # Push updated weights + thresholds periodically
                 if games_collected % cfg.weight_push_interval == 0:
-                    state = {k: v.cpu() for k, v in net.state_dict().items()}
-                    payload = {'weights': state, 'thresholds': thresholds}
+                    state       = {k: v.cpu() for k, v in net.state_dict().items()}
+                    lam_state   = main_lam_ctrl.to_dict()
+                    wp = {'weights': state, 'thresholds': thresholds, 'lam_ctrl_state': lam_state}
                     for q in weight_queues:
-                        try:
-                            q.put_nowait(payload)
-                        except Exception:
-                            pass   # queue full — worker will catch it next round
+                        try:   q.put_nowait(wp)
+                        except Exception: pass
 
                 if games_this_iter % 10 == 0:
                     print(f"    collected {games_this_iter}/{cfg.games_per_iter} games  "
@@ -820,8 +795,7 @@ def main():
             effective_steps = min(cfg.train_steps + len(buffer)//5000, cfg.train_steps*2)
 
         train_start = time.time()
-        losses = train_step(net, optimizer, loader, device, effective_steps,
-                            policy_weight=cfg.policy_loss_weight)
+        losses = train_step(net, optimizer, loader, device, effective_steps)
 
         scheduler.step()
         train_time = time.time() - train_start
@@ -852,7 +826,7 @@ def main():
             thresholds = recalibrator.recalibrate(iteration)
             # Push new weights + thresholds to workers immediately
             state = {k: v.cpu() for k, v in net.state_dict().items()}
-            payload = {'weights': state, 'thresholds': thresholds}
+            payload = {'weights': state, 'thresholds': thresholds, 'lam_ctrl_state': main_lam_ctrl.to_dict()}
             for q in weight_queues:
                 try:
                     q.put_nowait(payload)
@@ -875,7 +849,12 @@ def main():
             'Var_Q_thresh':   thresholds['Var_Q_thresh'],
             'stop_rate':      recalibrator.history[-1].expected_stop_rate if recalibrator.history else None,
             'target_stop_rate': cfg.target_stop_rate,
-            'policy_loss_weight': cfg.policy_loss_weight,
+            # LearnedLambdaController diagnostics
+            'lam_w_h':     main_lam_ctrl.w_h.tolist(),
+            'lam_w_e':     main_lam_ctrl.w_e.tolist(),
+            'lam_loss_h':  round(main_lam_ctrl.running_loss_h, 5),
+            'lam_typical': round(main_lam_ctrl.lam_h_at(0.38, 0.61, 0.11), 4),
+            'lam_updates': main_lam_ctrl.total_updates,
             'iter_time':      round(time.time() - iter_start, 1),
             # Elo fields — present only on evaluation iterations, else null
             'elo':            elo_entry.get('elo',          None),
@@ -893,7 +872,8 @@ def main():
             ckpt_path = ckpt_dir / f'iter_{iteration:04d}.pt'
             save_checkpoint(str(ckpt_path), net, optimizer, iteration,
                             cfg, thresholds, log,
-                            elo_history=elo_evaluator.history if elo_evaluator else [])
+                            elo_history=elo_evaluator.history if elo_evaluator else [],
+                            lam_ctrl_state=main_lam_ctrl.to_dict())
             buffer.save(str(ckpt_dir / 'replay_buffer.pkl'))
             print(f"  ✓ Checkpoint saved: {ckpt_path}")
 
